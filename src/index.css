@@ -1,5 +1,27 @@
 @import "tailwindcss";
 
+:root {
+  color-scheme: dark;
+  background: #030712;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  overscroll-behavior: none;
+}
+
+button:focus-visible,
+input:focus-visible {
+  outline: 2px solid #22d3ee;
+  outline-offset: 3px;
+}
+
 @layer utilities {
   .glass { 
     background: rgba(255, 255, 255, 0.05); 
@@ -35,4 +57,15 @@
   cursor: pointer; 
   border: 2px solid white; 
   box-shadow: 0 0 10px rgba(168, 85, 247, 1); 
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
