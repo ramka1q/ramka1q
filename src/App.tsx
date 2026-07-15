@@ -1,185 +1,703 @@
-import React, { useState, useEffect } from 'react';
-import Setup from './components/Setup';
-import Game from './components/Game';
-import { Note, EnergyData } from './types';
-import { analyzeAudio } from './utils/audio';
-import { Loader2 } from 'lucide-react';
+import { Check, Copy, Loader2, Share2, X } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
+import Game from './components/Game';
+import Setup from './components/Setup';
+import {
+  HitReport,
+  OpponentHitPayload,
+  ScoreSnapshot,
+  ScoreUpdatePayload,
+  StartGamePayload,
+} from './protocol';
+import { EnergyData, Note } from './types';
+import { analyzeAudio } from './utils/audio';
+import { normalizeBeatmap } from './utils/beatmap';
+import { createInviteUrl, isLoopbackHostname } from './utils/invite';
+import { encodeMonoPcm16Wav, WAV_MIME_TYPE } from './utils/wav';
+
+type MultiplayerState = 'waiting' | 'playing' | null;
+type MultiplayerRole = 'host' | 'guest' | null;
+type InviteCopyState = 'idle' | 'copied';
+
+interface RoomJoinedPayload {
+  roomId: string;
+  requestId: string;
+  beatmap: unknown;
+  energyData: unknown;
+  audioBuffer: unknown;
+}
+
+interface PlayerJoinedPayload {
+  roomId: string;
+  playerCount: number;
+}
+
+const createRequestId = (): string => {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte =>
+    byte.toString(16).padStart(2, '0')).join('');
+};
+
+const createPlaybackContext = () => {
+  const AudioContextClass = window.AudioContext || (window as typeof window & {
+    webkitAudioContext?: typeof AudioContext;
+  }).webkitAudioContext;
+  if (!AudioContextClass) throw new Error('Web Audio is not supported by this browser.');
+  return new AudioContextClass();
+};
+
+const toArrayBuffer = (value: unknown): ArrayBuffer => {
+  if (value instanceof ArrayBuffer) return value.slice(0);
+  if (ArrayBuffer.isView(value)) {
+    const bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    return bytes.slice().buffer;
+  }
+  if (typeof value === 'object' && value !== null && 'data' in value) {
+    const data = (value as { data?: unknown }).data;
+    if (Array.isArray(data) && data.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255)) {
+      return Uint8Array.from(data).buffer;
+    }
+  }
+  throw new TypeError('The room audio payload is invalid.');
+};
+
+const copyTextToClipboard = async (value: string): Promise<void> => {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return;
+    } catch {
+      // Fall back for browsers that expose Clipboard API but deny access.
+    }
+  }
+
+  const textArea = document.createElement('textarea');
+  textArea.value = value;
+  textArea.readOnly = true;
+  textArea.style.position = 'fixed';
+  textArea.style.opacity = '0';
+  document.body.appendChild(textArea);
+  textArea.select();
+  try {
+    if (!document.execCommand('copy')) throw new Error('Copy command was rejected.');
+  } finally {
+    textArea.remove();
+  }
+};
+
+const parseEnergyData = (value: unknown): EnergyData[] => {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new TypeError('The room energy data is invalid.');
+  }
+  return value.map((point, index) => {
+    if (typeof point !== 'object' || point === null) {
+      throw new TypeError(`energyData[${index}] must be an object.`);
+    }
+    const candidate = point as Record<string, unknown>;
+    if (typeof candidate.time !== 'number'
+      || typeof candidate.energy !== 'number'
+      || typeof candidate.cumulativeDistance !== 'number') {
+      throw new TypeError(`energyData[${index}] contains invalid values.`);
+    }
+    return {
+      time: candidate.time,
+      energy: candidate.energy,
+      cumulativeDistance: candidate.cumulativeDistance,
+    };
+  });
+};
+
+const synchronizeClock = async (socket: Socket): Promise<number> => {
+  const samples: Array<{ offset: number; roundTrip: number }> = [];
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const sample = await new Promise<{ offset: number; roundTrip: number } | null>(resolve => {
+      const sentAtEpoch = Date.now();
+      const sentAtPerformance = performance.now();
+      let settled = false;
+      const timeoutId = window.setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          resolve(null);
+        }
+      }, 1500);
+
+      socket.emit('timeSync', (serverTime: unknown) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeoutId);
+        const receivedAtEpoch = Date.now();
+        if (typeof serverTime !== 'number' || !Number.isFinite(serverTime)) {
+          resolve(null);
+          return;
+        }
+        resolve({
+          offset: serverTime - ((sentAtEpoch + receivedAtEpoch) / 2),
+          roundTrip: performance.now() - sentAtPerformance,
+        });
+      });
+    });
+    if (sample) samples.push(sample);
+  }
+
+  if (samples.length === 0) throw new Error('Could not synchronize with the multiplayer server.');
+  samples.sort((left, right) => left.roundTrip - right.roundTrip);
+  return samples[0].offset;
+};
 
 export default function App() {
   const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
-  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [playbackContext, setPlaybackContext] = useState<AudioContext | null>(null);
   const [beatmap, setBeatmap] = useState<Note[]>([]);
   const [energyData, setEnergyData] = useState<EnergyData[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-  const [loadingText, setLoadingText] = useState("Generating Beatmap...");
-  
-  const [socket, setSocket] = useState<Socket | null>(null);
+  const [loadingText, setLoadingText] = useState('Generating beatmap…');
+  const [appError, setAppError] = useState<string | null>(null);
+
   const [roomId, setRoomId] = useState<string | null>(null);
   const [isMultiplayer, setIsMultiplayer] = useState(false);
-  const [multiplayerState, setMultiplayerState] = useState<"waiting" | "playing" | null>(null);
+  const [multiplayerState, setMultiplayerState] = useState<MultiplayerState>(null);
+  const [multiplayerRole, setMultiplayerRole] = useState<MultiplayerRole>(null);
+  const [playerCount, setPlayerCount] = useState(0);
+  const [inviteCopyState, setInviteCopyState] = useState<InviteCopyState>('idle');
   const [serverStartTime, setServerStartTime] = useState<number | null>(null);
-  const [opponentScore, setOpponentScore] = useState({ score: 0, combo: 0, misses: 0 });
+  const [opponentScore, setOpponentScore] = useState<ScoreSnapshot>({ score: 0, combo: 0, misses: 0 });
   const [opponentLastHit, setOpponentLastHit] = useState<number | null>(null);
 
-  useEffect(() => {
-    const newSocket = io();
-    setSocket(newSocket);
-    
-    newSocket.on("roomCreated", (id) => {
-      setRoomId(id);
-      setIsLoading(false);
-    });
+  const socketRef = useRef<Socket | null>(null);
+  const socketConnectionRef = useRef<Promise<Socket> | null>(null);
+  const playbackContextRef = useRef<AudioContext | null>(null);
+  const roomIdRef = useRef<string | null>(null);
+  const clockOffsetRef = useRef(0);
+  const sessionGenerationRef = useRef(0);
+  const pendingMultiplayerGenerationRef = useRef(0);
+  const pendingRequestIdRef = useRef<string | null>(null);
+  const scoreSequenceRef = useRef(0);
 
-    newSocket.on("roomJoined", async ({ roomId: id, beatmap: joinedBeatmap, energyData: serverEnergyData, audioBuffer: arrayBuffer, mimeType }) => {
-      setRoomId(id);
-      setIsMultiplayer(true);
-      setMultiplayerState("waiting");
-      setLoadingText("Processing Audio...");
-      setIsLoading(true);
-      
-      try {
-        const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-        const arrayBufferCopy = arrayBuffer.slice(0);
-        const buffer = await audioContext.decodeAudioData(arrayBuffer);
-        
-        const blob = new Blob([arrayBufferCopy], { type: mimeType || "audio/mp3" });
-        setAudioUrl(URL.createObjectURL(blob));
-        setAudioBuffer(buffer);
-        setBeatmap(joinedBeatmap);
-        setEnergyData(serverEnergyData);
-        newSocket.emit("playerReady", id);
-      } catch(e) {
-        alert("Error loading room audio.");
-        setIsMultiplayer(false);
-        setRoomId(null);
-        setIsLoading(false);
-      }
-    });
-
-    newSocket.on("playerJoined", (count) => {
-      // Just waiting for them to be ready
-    });
-
-    newSocket.on("startGame", (startTime) => {
-      setServerStartTime(startTime);
-      setMultiplayerState("playing");
-      setIsLoading(false);
-    });
-
-    newSocket.on("opponentScore", (data) => {
-      setOpponentScore(data);
-    });
-
-    newSocket.on("opponentHit", ({ lane }) => {
-      setOpponentLastHit(lane);
-      // Reset after a tiny delay so the effect triggers again if the same lane is hit
-      setTimeout(() => setOpponentLastHit(null), 50);
-    });
-
-    newSocket.on("roomError", (msg) => {
-      alert(msg);
-      setIsLoading(false);
-    });
-
-    return () => {
-      newSocket.disconnect();
-    };
+  const ensurePlaybackContext = useCallback(async () => {
+    let context = playbackContextRef.current;
+    if (!context || context.state === 'closed') {
+      context = createPlaybackContext();
+      playbackContextRef.current = context;
+      setPlaybackContext(context);
+    }
+    if (context.state === 'suspended') await context.resume();
+    return context;
   }, []);
 
-  const handleStart = async (file: File, sensitivity: number, beatmapFile?: File, mode?: 'single' | 'create') => {
-    setIsLoading(true);
-    setLoadingText("Generating Beatmap...");
-    try {
-      const { buffer, beatmap: generatedBeatmap, energyData } = await analyzeAudio(file, sensitivity);
-      let finalBeatmap = generatedBeatmap;
-      
-      if (beatmapFile) {
-        const text = await beatmapFile.text();
-        finalBeatmap = JSON.parse(text);
-        finalBeatmap = finalBeatmap.map((note: Note) => ({
-          ...note,
-          hit: false,
-          missed: false
-        }));
+  const resetSession = useCallback((leaveRoom = true) => {
+    sessionGenerationRef.current += 1;
+    const activeRoomId = roomIdRef.current;
+    if (leaveRoom && activeRoomId && socketRef.current) {
+      socketRef.current.emit('leaveRoom', activeRoomId);
+    }
+    roomIdRef.current = null;
+    pendingRequestIdRef.current = null;
+    setRoomId(null);
+    setAudioBuffer(null);
+    setPlaybackContext(null);
+    setBeatmap([]);
+    setEnergyData([]);
+    setIsMultiplayer(false);
+    setMultiplayerState(null);
+    setMultiplayerRole(null);
+    setPlayerCount(0);
+    setInviteCopyState('idle');
+    setServerStartTime(null);
+    setOpponentScore({ score: 0, combo: 0, misses: 0 });
+    setOpponentLastHit(null);
+    setIsLoading(false);
+    scoreSequenceRef.current = 0;
+
+    const context = playbackContextRef.current;
+    playbackContextRef.current = null;
+    if (context && context.state !== 'closed') void context.close().catch(() => undefined);
+  }, []);
+
+  const connectSocket = useCallback(async (): Promise<Socket> => {
+    const existing = socketRef.current;
+    if (existing?.connected) return existing;
+    if (socketConnectionRef.current) return socketConnectionRef.current;
+
+    const connection = new Promise<Socket>((resolve, reject) => {
+      const socket = existing ?? io({ autoConnect: false });
+      socketRef.current = socket;
+
+      if (!existing) {
+        socket.on('roomCreated', (id: string, requestId: string) => {
+          if (pendingMultiplayerGenerationRef.current !== sessionGenerationRef.current
+            || requestId !== pendingRequestIdRef.current) {
+            if (typeof id === 'string') socket.emit('leaveRoom', id);
+            return;
+          }
+          roomIdRef.current = id;
+          setRoomId(id);
+          setIsMultiplayer(true);
+          setMultiplayerState('waiting');
+          setMultiplayerRole('host');
+          setPlayerCount(1);
+          setIsLoading(false);
+          socket.emit('playerReady', id);
+        });
+
+        socket.on('roomJoined', (payload: RoomJoinedPayload) => {
+          void (async () => {
+            const generation = pendingMultiplayerGenerationRef.current;
+            const requestId = pendingRequestIdRef.current;
+            const isCurrentRequest = () => generation === sessionGenerationRef.current
+              && requestId !== null
+              && requestId === pendingRequestIdRef.current
+              && payload?.requestId === requestId;
+            if (!isCurrentRequest()) {
+              if (typeof payload?.roomId === 'string') socket.emit('leaveRoom', payload.roomId);
+              return;
+            }
+            roomIdRef.current = payload.roomId;
+            setRoomId(payload.roomId);
+            setLoadingText('Decoding shared audio…');
+            setIsLoading(true);
+            try {
+              const context = await ensurePlaybackContext();
+              if (!isCurrentRequest()) {
+                socket.emit('leaveRoom', payload.roomId);
+                return;
+              }
+              const decodedBuffer = await context.decodeAudioData(toArrayBuffer(payload.audioBuffer));
+              if (!isCurrentRequest()) {
+                socket.emit('leaveRoom', payload.roomId);
+                return;
+              }
+              const joinedEnergyData = parseEnergyData(payload.energyData);
+              const joinedBeatmap = normalizeBeatmap(payload.beatmap, {
+                energyData: joinedEnergyData,
+                audioDuration: decodedBuffer.duration,
+              });
+
+              setAudioBuffer(decodedBuffer);
+              setBeatmap(joinedBeatmap);
+              setEnergyData(joinedEnergyData);
+              setIsMultiplayer(true);
+              setMultiplayerState('waiting');
+              setMultiplayerRole('guest');
+              setPlayerCount(2);
+              setIsLoading(false);
+              const currentUrl = new URL(window.location.href);
+              if (currentUrl.searchParams.has('room')) {
+                currentUrl.searchParams.delete('room');
+                window.history.replaceState(window.history.state, '', currentUrl);
+              }
+              socket.emit('playerReady', payload.roomId);
+            } catch (error) {
+              if (!isCurrentRequest()) return;
+              console.error(error);
+              socket.emit('leaveRoom', payload.roomId);
+              resetSession(false);
+              setAppError(error instanceof Error ? error.message : 'Could not load the room audio.');
+            }
+          })();
+        });
+
+        socket.on('startGame', (payload: StartGamePayload) => {
+          if (!payload
+            || payload.roomId !== roomIdRef.current
+            || pendingMultiplayerGenerationRef.current !== sessionGenerationRef.current) {
+            return;
+          }
+          if (!Number.isFinite(payload.startTime)) {
+            setAppError('The server returned an invalid start time.');
+            return;
+          }
+          setServerStartTime(payload.startTime - clockOffsetRef.current);
+          setMultiplayerState('playing');
+          setIsLoading(false);
+        });
+
+        socket.on('opponentScore', (data: ScoreSnapshot) => {
+          if (data && Number.isFinite(data.score) && Number.isFinite(data.combo) && Number.isFinite(data.misses)) {
+            setOpponentScore(data);
+          }
+        });
+
+        socket.on('opponentHit', ({ lane }: OpponentHitPayload) => {
+          if (!Number.isInteger(lane) || lane < 0 || lane > 3) return;
+          setOpponentLastHit(lane);
+          window.setTimeout(() => setOpponentLastHit(null), 60);
+        });
+
+        socket.on('playerJoined', (payload: PlayerJoinedPayload) => {
+          if (!payload
+            || payload.roomId !== roomIdRef.current
+            || !Number.isInteger(payload.playerCount)
+            || payload.playerCount < 1
+            || payload.playerCount > 2) {
+            return;
+          }
+          setPlayerCount(payload.playerCount);
+        });
+
+        socket.on('playerLeft', (leftRoomId: string) => {
+          if (leftRoomId !== roomIdRef.current) return;
+          resetSession(true);
+          setAppError('The other player left the room.');
+        });
+
+        socket.on('roomError', (message: unknown, requestId?: string) => {
+          if (requestId !== undefined && requestId !== pendingRequestIdRef.current) return;
+          if (!roomIdRef.current && (
+            requestId === undefined
+            || pendingMultiplayerGenerationRef.current !== sessionGenerationRef.current
+          )) {
+            return;
+          }
+          resetSession(true);
+          setAppError(typeof message === 'string' ? message : 'The multiplayer request failed.');
+        });
+
+        socket.on('gameplayError', (message: unknown) => {
+          if (!roomIdRef.current) return;
+          setAppError(typeof message === 'string' ? message : 'A gameplay update was rejected.');
+        });
+
+        socket.on('connect_error', (error: Error) => {
+          if (!roomIdRef.current
+            && pendingMultiplayerGenerationRef.current !== sessionGenerationRef.current) {
+            return;
+          }
+          setIsLoading(false);
+          setAppError(`Multiplayer connection failed: ${error.message}`);
+        });
+
+        socket.on('disconnect', () => {
+          const hasPendingRequest = pendingMultiplayerGenerationRef.current !== 0
+            && pendingMultiplayerGenerationRef.current === sessionGenerationRef.current;
+          if (!roomIdRef.current && !hasPendingRequest) return;
+          resetSession(false);
+          setAppError('The multiplayer connection was lost.');
+        });
       }
 
-      if (mode === 'create') {
-        setLoadingText("Creating Room...");
-        const arrayBuffer = await file.arrayBuffer();
-        socket?.emit("createRoom", { beatmap: finalBeatmap, energyData, audioBuffer: arrayBuffer, mimeType: file.type });
+      const timeoutId = window.setTimeout(() => {
+        cleanup();
+        reject(new Error('Timed out while connecting to the multiplayer server.'));
+      }, 8000);
+      const cleanup = () => {
+        window.clearTimeout(timeoutId);
+        socket.off('connect', handleConnect);
+        socket.off('connect_error', handleInitialError);
+      };
+      const handleConnect = () => {
+        cleanup();
+        resolve(socket);
+      };
+      const handleInitialError = (error: Error) => {
+        cleanup();
+        reject(error);
+      };
+
+      socket.once('connect', handleConnect);
+      socket.once('connect_error', handleInitialError);
+      socket.connect();
+    });
+
+    socketConnectionRef.current = connection;
+    try {
+      return await connection;
+    } finally {
+      socketConnectionRef.current = null;
+    }
+  }, [ensurePlaybackContext, resetSession]);
+
+  useEffect(() => () => {
+    sessionGenerationRef.current += 1;
+    roomIdRef.current = null;
+    socketRef.current?.disconnect();
+    const context = playbackContextRef.current;
+    if (context && context.state !== 'closed') void context.close().catch(() => undefined);
+  }, []);
+
+  const handleStart = async (
+    file: File,
+    sensitivity: number,
+    beatmapFile?: File,
+    mode: 'single' | 'create' = 'single',
+  ) => {
+    const generation = sessionGenerationRef.current + 1;
+    const requestId = mode === 'create' ? createRequestId() : null;
+    sessionGenerationRef.current = generation;
+    pendingMultiplayerGenerationRef.current = mode === 'create' ? generation : 0;
+    pendingRequestIdRef.current = requestId;
+    scoreSequenceRef.current = 0;
+    setIsLoading(true);
+    setAppError(null);
+    setLoadingText('Analyzing transients and generating beatmap…');
+
+    try {
+      const contextPromise = ensurePlaybackContext();
+      const socketPromise = mode === 'create' ? connectSocket() : Promise.resolve(null);
+      const [{ buffer, beatmap: generatedBeatmap, energyData: generatedEnergyData }, context, socket] = await Promise.all([
+        analyzeAudio(file, sensitivity),
+        contextPromise,
+        socketPromise,
+      ]);
+      if (generation !== sessionGenerationRef.current) return;
+
+      let finalBeatmap = generatedBeatmap;
+      if (beatmapFile) {
+        const beatmapText = await beatmapFile.text();
+        if (generation !== sessionGenerationRef.current) return;
+        finalBeatmap = normalizeBeatmap(JSON.parse(beatmapText) as unknown, {
+          energyData: generatedEnergyData,
+          audioDuration: buffer.duration,
+        });
+      }
+
+      setPlaybackContext(context);
+      setAudioBuffer(buffer);
+      setBeatmap(finalBeatmap);
+      setEnergyData(generatedEnergyData);
+
+      if (mode === 'create' && socket) {
+        setLoadingText('Optimizing shared audio…');
+        await new Promise<void>(resolve => window.setTimeout(resolve, 0));
+        if (generation !== sessionGenerationRef.current
+          || requestId !== pendingRequestIdRef.current) return;
+        const encodedAudio = encodeMonoPcm16Wav(buffer);
+
+        setLoadingText('Creating room…');
+        clockOffsetRef.current = await synchronizeClock(socket);
+        if (generation !== sessionGenerationRef.current
+          || requestId !== pendingRequestIdRef.current) return;
         setIsMultiplayer(true);
-        setMultiplayerState("waiting");
-        setAudioUrl(URL.createObjectURL(file));
-        setAudioBuffer(buffer);
-        setBeatmap(finalBeatmap);
-        setEnergyData(energyData);
+        setMultiplayerState('waiting');
+        socket.emit('createRoom', {
+          requestId,
+          beatmap: finalBeatmap,
+          energyData: generatedEnergyData,
+          audioBuffer: encodedAudio,
+          mimeType: WAV_MIME_TYPE,
+        });
       } else {
         setIsMultiplayer(false);
-        setAudioUrl(URL.createObjectURL(file));
-        setAudioBuffer(buffer);
-        setBeatmap(finalBeatmap);
-        setEnergyData(energyData);
+        setMultiplayerState(null);
         setIsLoading(false);
       }
-    } catch (e) {
-      alert("Error processing files. Please check the JSON format or audio file.");
-      console.error(e);
-      setIsLoading(false);
+    } catch (error) {
+      if (generation !== sessionGenerationRef.current) return;
+      console.error(error);
+      resetSession(false);
+      setAppError(error instanceof Error ? error.message : 'Could not process the selected files.');
     }
   };
 
-  const handleJoin = (id: string) => {
-    setLoadingText("Joining Room...");
+  const handleJoin = async (id: string) => {
+    const generation = sessionGenerationRef.current + 1;
+    const requestId = createRequestId();
+    sessionGenerationRef.current = generation;
+    pendingMultiplayerGenerationRef.current = generation;
+    pendingRequestIdRef.current = requestId;
+    scoreSequenceRef.current = 0;
+    setLoadingText('Joining room…');
     setIsLoading(true);
-    socket?.emit("joinRoom", id);
-  };
-
-  const handleScoreUpdate = (score: number, combo: number, misses: number) => {
-    if (isMultiplayer && roomId && socket) {
-      socket.emit("updateScore", { roomId, score, combo, misses });
+    setAppError(null);
+    try {
+      await ensurePlaybackContext();
+      if (generation !== sessionGenerationRef.current) return;
+      const socket = await connectSocket();
+      if (generation !== sessionGenerationRef.current) return;
+      clockOffsetRef.current = await synchronizeClock(socket);
+      if (generation !== sessionGenerationRef.current
+        || requestId !== pendingRequestIdRef.current) return;
+      socket.emit('joinRoom', {
+        roomId: id.trim().toUpperCase(),
+        requestId,
+      });
+    } catch (error) {
+      if (generation !== sessionGenerationRef.current) return;
+      resetSession(false);
+      setAppError(error instanceof Error ? error.message : 'Could not join the room.');
     }
   };
 
-  const handleHit = (lane: number) => {
-    if (isMultiplayer && roomId && socket) {
-      socket.emit("opponentHit", { roomId, lane });
+  const handleScoreUpdate = useCallback((score: number, combo: number, misses: number) => {
+    const id = roomIdRef.current;
+    if (id && socketRef.current) {
+      const payload: ScoreUpdatePayload = {
+        roomId: id,
+        sequence: scoreSequenceRef.current + 1,
+        score,
+        combo,
+        misses,
+      };
+      scoreSequenceRef.current = payload.sequence;
+      socketRef.current.emit('updateScore', payload);
+    }
+  }, []);
+
+  const handleHit = useCallback(({ noteId, hitTime }: HitReport) => {
+    const id = roomIdRef.current;
+    if (id && socketRef.current) {
+      socketRef.current.emit('opponentHit', { roomId: id, noteId, hitTime });
+    }
+  }, []);
+
+  const configuredPublicAppUrl = typeof import.meta.env.VITE_PUBLIC_APP_URL === 'string'
+    ? import.meta.env.VITE_PUBLIC_APP_URL.trim()
+    : '';
+  let inviteUrl: string | null = null;
+  if (roomId) {
+    try {
+      inviteUrl = createInviteUrl(configuredPublicAppUrl || window.location.href, roomId);
+    } catch {
+      try {
+        inviteUrl = createInviteUrl(window.location.href, roomId);
+      } catch {
+        inviteUrl = null;
+      }
+    }
+  }
+  const inviteIsLocal = inviteUrl !== null
+    && isLoopbackHostname(new URL(inviteUrl).hostname);
+  const nativeShare = (navigator as unknown as {
+    share?: (data?: ShareData) => Promise<void>;
+  }).share;
+
+  const handleCopyInvite = async () => {
+    if (!inviteUrl || inviteIsLocal) return;
+    try {
+      await copyTextToClipboard(inviteUrl);
+      setInviteCopyState('copied');
+      window.setTimeout(() => setInviteCopyState('idle'), 2_000);
+    } catch (error) {
+      console.error(error);
+      setAppError('Could not copy the invite link. Select and copy it manually.');
+    }
+  };
+
+  const handleShareInvite = async () => {
+    if (!inviteUrl || inviteIsLocal) return;
+    if (!nativeShare) {
+      await handleCopyInvite();
+      return;
+    }
+    try {
+      await nativeShare.call(navigator, {
+        title: 'FNF X-CREATOR room',
+        text: `Join my room ${roomId ?? ''}. You do not need the audio file.`,
+        url: inviteUrl,
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return;
+      console.error(error);
+      setAppError('Could not open the share menu. You can copy the invite link instead.');
     }
   };
 
   return (
-    <div className="min-h-screen bg-gray-950 text-white font-sans selection:bg-purple-500/30">
+    <div className="min-h-[100dvh] bg-gray-950 font-sans text-white selection:bg-purple-500/30">
+      {appError && (
+        <div role="alert" className="fixed left-1/2 top-4 z-[70] flex w-[min(92vw,42rem)] -translate-x-1/2 items-center justify-between gap-4 rounded-xl border border-red-400/30 bg-red-950/95 px-5 py-4 text-sm text-red-100 shadow-2xl backdrop-blur">
+          <span>{appError}</span>
+          <button type="button" onClick={() => setAppError(null)} aria-label="Dismiss error" className="rounded p-1 hover:bg-white/10">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+
       {isLoading && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm">
-          <div className="flex flex-col items-center gap-4">
-            <Loader2 className="w-12 h-12 text-cyan-400 animate-spin" />
-            <h2 className="text-xl font-bold bg-gradient-to-r from-purple-400 to-cyan-400 bg-clip-text text-transparent animate-pulse">{loadingText}</h2>
+          <div className="flex flex-col items-center gap-4 px-6 text-center">
+            <Loader2 className="h-12 w-12 animate-spin text-cyan-400" />
+            <h2 className="animate-pulse bg-gradient-to-r from-purple-400 to-cyan-400 bg-clip-text text-xl font-bold text-transparent">{loadingText}</h2>
           </div>
         </div>
       )}
-      
-      {!audioBuffer ? (
-        <Setup onStart={(f, s, b) => handleStart(f, s, b, 'single')} onCreate={(f, s, b) => handleStart(f, s, b, 'create')} onJoin={handleJoin} />
-      ) : isMultiplayer && multiplayerState === "waiting" ? (
-        <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-gray-900">
-          <h2 className="text-4xl font-black text-white mb-4">ROOM CREATED</h2>
-          <p className="text-xl text-gray-400 mb-8">Share this code with your opponent:</p>
-          <div className="text-6xl font-mono text-cyan-400 font-bold bg-black/50 px-8 py-4 rounded-xl border border-cyan-500/30 shadow-[0_0_30px_rgba(34,211,238,0.2)] mb-8 select-all min-h-[96px] flex items-center justify-center">
-            {roomId || "..."}
-          </div>
-          <div className="flex items-center gap-3">
-            <Loader2 className="w-6 h-6 text-purple-400 animate-spin" />
-            <span className="text-purple-400 animate-pulse font-bold tracking-widest uppercase text-sm">Waiting for opponent to join...</span>
-          </div>
-          <button onClick={() => { setAudioBuffer(null); setAudioUrl(null); setRoomId(null); setIsMultiplayer(false); }} className="mt-12 px-6 py-2 border border-red-500/50 text-red-400 hover:bg-red-500/10 rounded uppercase font-bold text-xs tracking-widest">Cancel</button>
+
+      {!audioBuffer || !playbackContext ? (
+        <Setup
+          onStart={(file, sensitivity, importedMap) => void handleStart(file, sensitivity, importedMap, 'single')}
+          onCreate={(file, sensitivity, importedMap) => void handleStart(file, sensitivity, importedMap, 'create')}
+          onJoin={(id) => void handleJoin(id)}
+        />
+      ) : isMultiplayer && multiplayerState === 'waiting' ? (
+        <div className="fixed inset-0 z-40 flex flex-col items-center justify-center overflow-y-auto bg-gray-900 px-6 py-10 text-center">
+          {multiplayerRole === 'host' ? (
+            <>
+              <h2 className="mb-3 text-4xl font-black text-white">ROOM READY</h2>
+              <p className="mb-6 max-w-xl text-base text-gray-300 sm:text-lg">
+                Send this invite to your friend. The track downloads automatically, so they do not need your audio or video file.
+              </p>
+              <div className="mb-6 flex min-h-20 items-center justify-center rounded-xl border border-cyan-500/30 bg-black/50 px-8 py-4 font-mono text-4xl font-bold text-cyan-400 shadow-[0_0_30px_rgba(34,211,238,0.2)] sm:text-5xl">
+                {roomId || '…'}
+              </div>
+
+              {inviteIsLocal ? (
+                <div role="status" className="mb-7 max-w-xl rounded-xl border border-amber-400/40 bg-amber-500/10 px-5 py-4 text-sm text-amber-100">
+                  This page is running on localhost. Deploy it to a public address before sending an invite to a remote friend.
+                </div>
+              ) : inviteUrl ? (
+                <div className="mb-7 w-full max-w-xl rounded-xl border border-white/10 bg-black/30 p-3">
+                  <label htmlFor="invite-url" className="sr-only">Room invite link</label>
+                  <input
+                    id="invite-url"
+                    readOnly
+                    value={inviteUrl}
+                    onFocus={event => event.currentTarget.select()}
+                    className="w-full rounded-lg border border-gray-700 bg-gray-950 px-3 py-2 text-sm text-gray-200 outline-none focus:border-cyan-400"
+                  />
+                  <div className="mt-3 flex flex-wrap justify-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void handleCopyInvite()}
+                      className="flex items-center gap-2 rounded-lg bg-cyan-500 px-4 py-2 text-xs font-black uppercase tracking-wider text-gray-950 transition hover:bg-cyan-300"
+                    >
+                      {inviteCopyState === 'copied' ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+                      {inviteCopyState === 'copied' ? 'Copied' : 'Copy invite'}
+                    </button>
+                    {nativeShare && (
+                      <button
+                        type="button"
+                        onClick={() => void handleShareInvite()}
+                        className="flex items-center gap-2 rounded-lg border border-purple-400/40 bg-purple-500/10 px-4 py-2 text-xs font-black uppercase tracking-wider text-purple-100 transition hover:bg-purple-500/20"
+                      >
+                        <Share2 className="h-4 w-4" /> Share
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ) : null}
+
+              <div aria-live="polite" className="flex items-center gap-3">
+                <Loader2 className="h-6 w-6 animate-spin text-purple-400" />
+                <span className="text-sm font-bold uppercase tracking-widest text-purple-300">
+                  {playerCount >= 2 ? 'Friend joined—synchronizing…' : `Waiting for friend… ${Math.max(1, playerCount)}/2`}
+                </span>
+              </div>
+            </>
+          ) : (
+            <>
+              <h2 className="mb-3 text-4xl font-black text-white">TRACK READY</h2>
+              <p className="mb-6 max-w-xl text-lg text-gray-300">
+                The host&apos;s audio is already downloaded. You do not need to select or receive any file.
+              </p>
+              <div className="mb-7 rounded-xl border border-cyan-500/30 bg-black/40 px-6 py-3 font-mono text-2xl font-bold text-cyan-300">
+                {roomId || '…'}
+              </div>
+              <div aria-live="polite" className="flex items-center gap-3">
+                <Loader2 className="h-6 w-6 animate-spin text-purple-400" />
+                <span className="text-sm font-bold uppercase tracking-widest text-purple-300">Synchronizing the start…</span>
+              </div>
+            </>
+          )}
+          <button type="button" onClick={() => resetSession(true)} className="mt-12 rounded border border-red-500/50 px-6 py-2 text-xs font-bold uppercase tracking-widest text-red-400 hover:bg-red-500/10">Cancel</button>
         </div>
       ) : (
-        <Game 
-          audioUrl={audioUrl!}
-          audioBuffer={audioBuffer} 
-          initialBeatmap={beatmap} 
+        <Game
+          audioBuffer={audioBuffer}
+          audioContext={playbackContext}
+          initialBeatmap={beatmap}
           energyData={energyData}
-          onBack={() => { setAudioBuffer(null); setAudioUrl(null); setRoomId(null); setIsMultiplayer(false); }} 
+          onBack={() => resetSession(true)}
           isMultiplayer={isMultiplayer}
           serverStartTime={serverStartTime}
           opponentScore={opponentScore}
@@ -191,4 +709,3 @@ export default function App() {
     </div>
   );
 }
-

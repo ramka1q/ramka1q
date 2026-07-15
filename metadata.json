@@ -1,6 +1,6 @@
 {
-  "name": "",
-  "description": "",
+  "name": "FNF X-Creator",
+  "description": "Create adaptive rhythm beatmaps locally and play solo or in a two-player room.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": []
 }

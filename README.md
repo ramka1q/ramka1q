@@ -1,20 +1,55 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# FNF X-Creator
 
-# Run and deploy your AI Studio app
+FNF X-Creator is a browser rhythm game that builds an adaptive beatmap from an audio or video file. Audio analysis runs locally in the browser using Web Audio energy and peak detection; it does not use an AI service or require an API key.
 
-This contains everything you need to run your app locally.
+You can play a generated or imported JSON beatmap in single-player mode, or create a two-player room backed by Socket.IO. In multiplayer, only the host chooses the audio or video: the server relays the prepared track and beatmap to the friend automatically.
 
-View your app in AI Studio: https://ai.studio/apps/1e8f5dc3-8d07-4200-a0af-729abcb3baa0
+## Requirements
 
-## Run Locally
+- Node.js 24 LTS
+- npm
 
-**Prerequisites:**  Node.js
+## Run locally
 
+```sh
+npm ci
+npm run dev
+```
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+The app is served at `http://localhost:3000` by default. Set `PORT` and `APP_ORIGIN` in the process environment when a different port or public origin is required; [.env.example](.env.example) documents both values.
+
+## Play online with a friend
+
+Both players use the same public Node/Socket.IO app URL; a `localhost` link cannot be opened by a friend on another device.
+
+1. The host opens the public app, chooses an audio or video file, and creates a multiplayer room.
+2. The host copies and sends the generated invite link.
+3. The friend opens the link and clicks **Join & enable sound**. No audio or video file is needed on the friend's device.
+4. The shared track downloads from the room server, then the game starts for both players in sync.
+
+## Deploy free on Render
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/ramka1q/ramka1q)
+
+Deploy this repository as one Node web service so the built browser app and Socket.IO server share a single public URL. Open the generated `onrender.com` address, create a room, and send its invite link to your friend.
+
+Render's free service can sleep while idle, so the first request after a pause may take longer. Rooms are held only in server memory and disappear when the service sleeps, restarts, or redeploys; create a new room afterward.
+
+## Quality and production commands
+
+```sh
+npm run typecheck
+npm test
+npm run build
+npm start
+```
+
+`npm run check` runs type checking, tests, and a production build. The build keeps browser assets in `dist/client` and the Node server bundle in `dist/server`.
+
+## Multiplayer limits
+
+Local audio files are limited to 100 MiB and 25 minutes. Before multiplayer upload, the shared audio is optimized to mono 32 kHz PCM WAV. The relayed result is limited to 32 MiB per room, which is approximately 8 minutes 44 seconds in this format. The server reserves at most 256 MiB for active room audio, beatmaps, indexes, and energy data. Rooms expire after 30 minutes of inactivity (or shortly after a game ends) and are lost when the server restarts.
+
+A room works only on the server instance that created it. Production horizontal scaling therefore requires shared room storage and a Socket.IO adapter. Set `APP_ORIGIN` to the exact public browser origin when the Socket.IO endpoint is exposed through a proxy or custom domain. Admission limits use the direct socket address by default. Set `TRUST_PROXY=true` only when a trusted reverse proxy overwrites `X-Forwarded-For` and direct access to Node is blocked; otherwise forwarded addresses can be spoofed. Without that opt-in, proxied users share one server-side address bucket.
+
+Multiplayer is intended for casual play: the server validates membership, unique note IDs, hit timing, monotonic score snapshots, replay sequence numbers, and score ceilings derived from accepted notes. It still does not run a fully authoritative replay of every physical input.
