@@ -3,7 +3,7 @@ services:
     name: fnf-x-creator
     runtime: node
     plan: free
-    buildCommand: NODE_ENV=development npm ci && npm run build
+    buildCommand: NODE_ENV=development npm ci --allow-remote=all --dangerously-allow-all-scripts && npm run build
     startCommand: NODE_ENV=production npm start
     healthCheckPath: /healthz
     envVars:
