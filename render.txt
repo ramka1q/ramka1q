@@ -1,0 +1,246 @@
+      ctx.clearRect(0, 0, width, height);
+      ctx.save();
+      
+      let tier = 2;
+      if (targetEnergy > 0.8) tier = 4;
+      else if (targetEnergy > 0.6) tier = 3;
+      else if (targetEnergy > 0.4) tier = 2;
+      else if (targetEnergy > 0.2) tier = 1;
+      else tier = 0;
+
+      const getLaneColor = (lane: number) => {
+        if (tier === 0) return '#6b7280'; // gray-500
+        if (tier === 1) return ['#7e22ce', '#0e7490', '#15803d', '#b91c1c'][lane];
+        if (tier === 2) return COLORS[lane];
+        if (tier === 3) return ['#e9d5ff', '#a5f3fc', '#bbf7d0', '#fecaca'][lane];
+        if (tier === 4) {
+          const hue = ((s.currentTime * 400) + lane * 90) % 360;
+          return `hsl(${hue}, 100%, 65%)`;
+        }
+        return COLORS[lane];
+      };
+
+      if (isPlaying) {
+         if (tier === 0) {
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+            ctx.fillRect(0, 0, width, height);
+         } else if (tier === 3) {
+            const pulse = (Math.sin(s.currentTime * Math.PI * 2 * 2.5) * 0.5 + 0.5) * 0.15;
+            ctx.fillStyle = `rgba(168, 85, 247, ${pulse})`;
+            ctx.fillRect(0, 0, width, height);
+         } else if (tier === 4) {
+            const intensity = (targetEnergy - 0.8) * 5;
+            const shakeX = (Math.random() - 0.5) * 15 * intensity;
+            const shakeY = (Math.random() - 0.5) * 15 * intensity;
+            ctx.translate(shakeX, shakeY);
+            
+            ctx.fillStyle = `rgba(168, 85, 247, ${intensity * 0.2})`;
+            ctx.fillRect(-20, -20, width + 40, height + 40);
+            
+            if (intensity > 0.3 && Math.random() < 0.4) {
+              spawnParticles(Math.random() * width, height, getLaneColor(Math.floor(Math.random() * 4)));
+            }
+         }
+      }
+
+      // Editor Grid
+      if (isEditor) {
+        ctx.strokeStyle = '#1f2937';
+        ctx.lineWidth = 1;
+        for(let i=1; i<4; i++) {
+          ctx.beginPath();
+          ctx.moveTo(i*laneWidth, -20);
+          ctx.lineTo(i*laneWidth, height + 20);
+          ctx.stroke();
+        }
+        ctx.strokeStyle = 'rgba(234, 179, 8, 0.5)'; // Yellow line for current time
+        ctx.beginPath();
+        ctx.moveTo(-20, RECEPTOR_Y);
+        ctx.lineTo(width + 20, RECEPTOR_Y);
+        ctx.stroke();
+      }
+
+      // Receptors
+      for (let i = 0; i < 4; i++) {
+        const x = i * laneWidth + laneWidth / 2;
+        const laneColor = isPlaying ? getLaneColor(i) : COLORS[i];
+        if (s.keyEffects[i] > 0) {
+          s.keyEffects[i] -= 0.05;
+          const glow = s.keyEffects[i];
+          
+          ctx.globalAlpha = 0.1;
+          ctx.fillStyle = laneColor; 
+          ctx.fillRect(i * laneWidth, -20, laneWidth, height + 40); // Lane highlight
+          ctx.globalAlpha = 1.0;
+
+          ctx.globalAlpha = 0.5 + glow * 0.5;
+          drawArrow(ctx, x, RECEPTOR_Y, arrowSize * (1 - glow * 0.1), i, laneColor, 'pressed');
+          ctx.globalAlpha = 1.0;
+        } else {
+          drawArrow(ctx, x, RECEPTOR_Y, arrowSize, i, tier === 0 && isPlaying ? '#374151' : '#4a5568', 'ghost');
+        }
+      }
+
+      // Notes
+      s.beatmap.forEach(note => {
+        let noteDist = note.cumulativeDistance;
+        if (noteDist === undefined) {
+           // Fallback for notes without cumulativeDistance (e.g. created in editor before update)
+           if (energyData && energyData.length > 0 && audioBuffer.duration > 0) {
+              const exactIdx = (note.time / audioBuffer.duration) * energyData.length;
+              const idx1 = Math.floor(exactIdx);
+              const idx2 = Math.min(idx1 + 1, energyData.length - 1);
+              const t = exactIdx - idx1;
+              
+              const dp1 = energyData[Math.min(Math.max(idx1, 0), energyData.length - 1)];
+              const dp2 = energyData[Math.min(Math.max(idx2, 0), energyData.length - 1)];
+              noteDist = dp1.cumulativeDistance + (dp2.cumulativeDistance - dp1.cumulativeDistance) * t;
+           } else {
+              noteDist = note.time * SCROLL_SPEED;
+           }
+           note.cumulativeDistance = noteDist;
+        }
+
+        const distanceDiff = noteDist - currentDistance;
+        const timeDiff = note.time - s.currentTime;
+        const y = RECEPTOR_Y + distanceDiff;
+
+        const x = note.lane * laneWidth + laneWidth / 2;
+
+        // Draw Tail for long notes
+        if (note.duration && note.duration > 0 && note.cumulativeDistanceEnd !== undefined) {
+           const endDist = note.cumulativeDistanceEnd;
+           const yEnd = RECEPTOR_Y + (endDist - currentDistance);
+           
+           if (yEnd > -100 && y < height + 100) {
+             const drawYStart = (note.hit && !note.missed && s.currentTime > note.time) ? Math.min(yEnd, RECEPTOR_Y) : y;
+             
+             if (drawYStart < yEnd) {
+                const laneColor = isPlaying ? getLaneColor(note.lane) : COLORS[note.lane];
+                ctx.save();
+                ctx.globalAlpha = note.hit ? 0.8 : 0.6;
+                ctx.fillStyle = laneColor;
+                ctx.shadowColor = laneColor;
+                ctx.shadowBlur = note.hit ? 15 : 5;
+                
+                const tailWidth = 24;
+                ctx.beginPath();
+                ctx.roundRect(x - tailWidth/2, drawYStart, tailWidth, Math.max(1, yEnd - drawYStart), tailWidth/2);
+                ctx.fill();
+                ctx.restore();
+             }
+           }
+        }
+
+        if (y > -100 && y < height + 100) {
+          if (!note.hit && !note.missed) {
+            drawArrow(ctx, x, y, arrowSize, note.lane, isPlaying ? getLaneColor(note.lane) : COLORS[note.lane], 'normal');
+          } else if (isEditor) {
+            ctx.globalAlpha = 0.3;
+            drawArrow(ctx, x, y, arrowSize, note.lane, COLORS[note.lane], 'normal');
+            ctx.globalAlpha = 1.0;
+          }
+        }
+
+        // Miss logic
+        if (isPlaying && !note.hit && !note.missed && timeDiff < -HIT_WINDOWS.bad) {
+          note.missed = true;
+          s.gameState.combo = 0;
+          s.gameState.health = Math.max(0, s.gameState.health - 2.5);
+          s.gameState.misses++;
+          addPopup('MISS', '#ef4444', x, RECEPTOR_Y);
+        }
+
+        // Hold logic
+        if (isPlaying && note.duration && note.duration > 0 && note.hit && !note.missed) {
+          const endTime = note.time + note.duration;
+          if (s.currentTime >= note.time && s.currentTime <= endTime) {
+            if (s.keys[note.lane]) {
+               s.gameState.score += 2; 
+               s.gameState.health = Math.min(100, s.gameState.health + 0.02);
+               s.keyEffects[note.lane] = 1.0;
+               if (Math.random() < 0.15) spawnParticles(x, RECEPTOR_Y, getLaneColor(note.lane));
+            } else {
+               if (s.currentTime < endTime - 0.15) { // grace period
+                  note.missed = true; 
+                  addPopup('DROP', '#ef4444', x, RECEPTOR_Y);
+                  s.gameState.combo = 0;
+                  s.gameState.health -= 2;
+               }
+            }
+          }
+        }
+      });
+
+      // Popups
+      for (let i = s.popups.length - 1; i >= 0; i--) {
+        const p = s.popups[i];
+        p.life -= 0.03;
+        p.y -= 1.5;
+        if (p.life <= 0) {
+          s.popups.splice(i, 1);
+          continue;
+        }
+        ctx.save();
+        ctx.globalAlpha = p.life;
+        ctx.font = '900 40px sans-serif';
+        ctx.fillStyle = p.color;
+        ctx.textAlign = 'center';
+        ctx.shadowColor = p.color;
+        ctx.shadowBlur = 10;
+        ctx.fillText(p.text, p.x, p.y);
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 1;
+        ctx.strokeText(p.text, p.x, p.y);
+        ctx.restore();
+      }
+
+      // Particles
+      for (let i = s.particles.length - 1; i >= 0; i--) {
+        const p = s.particles[i];
+        p.life -= 0.02;
+        p.x += p.vx;
+        p.y += p.vy;
+        if (p.life <= 0) {
+          s.particles.splice(i, 1);
+          continue;
+        }
+        ctx.save();
+        ctx.globalAlpha = p.life;
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      ctx.restore(); // Restore shake/translate
+
+      // Update DOM UI elements directly for 60fps performance without React overhead
+      const scoreEl = document.getElementById('ui-score');
+      if (scoreEl) scoreEl.innerText = s.gameState.score.toString();
+
+      const comboEl = document.getElementById('ui-combo');
+      if (comboEl) comboEl.innerText = s.gameState.combo.toString();
+
+      const maxComboEl = document.getElementById('ui-maxcombo');
+      if (maxComboEl) maxComboEl.innerText = s.gameState.maxCombo.toString();
+
+      const hitsEl = document.getElementById('ui-hits');
+      if (hitsEl) hitsEl.innerText = s.gameState.hits.toString();
+
+      const healthEl = document.getElementById('ui-health');
+      if (healthEl) healthEl.style.width = `${s.gameState.health}%`;
+
+      const progressEl = document.getElementById('ui-progress');
+      if (progressEl && audioBuffer.duration > 0) {
+         progressEl.style.width = `${(s.currentTime / audioBuffer.duration) * 100}%`;
+      }
+
+      if (s.gameState.health <= 0 && isPlaying) {
+         // Game Over logic could go here
+         ctx.fillStyle = 'rgba(255,0,0,0.5)';
+         ctx.fillRect(0,0,width,height);
+         ctx.textAlign = 'center';
+         ctx.font = 'bold 64px sans-serif';
+         ctx.fillStyle = '#fff';

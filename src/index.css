@@ -1,0 +1,38 @@
+@import "tailwindcss";
+
+@layer utilities {
+  .glass { 
+    background: rgba(255, 255, 255, 0.05); 
+    backdrop-filter: blur(12px); 
+    border: 1px solid rgba(255, 255, 255, 0.1); 
+    border-radius: 1.5rem; 
+  }
+  .neon-border-purple { 
+    box-shadow: 0 0 15px rgba(168, 85, 247, 0.4); 
+    border: 1px solid rgba(168, 85, 247, 0.5); 
+  }
+  .neon-text-pink { 
+    text-shadow: 0 0 10px rgba(236, 72, 153, 0.8); 
+  }
+}
+
+.custom-slider::-webkit-slider-thumb { 
+  -webkit-appearance: none; 
+  appearance: none; 
+  width: 18px; 
+  height: 18px; 
+  background: #a855f7; 
+  border-radius: 50%; 
+  cursor: pointer; 
+  border: 2px solid white; 
+  box-shadow: 0 0 10px rgba(168, 85, 247, 1); 
+}
+.custom-slider::-moz-range-thumb {
+  width: 18px; 
+  height: 18px; 
+  background: #a855f7; 
+  border-radius: 50%; 
+  cursor: pointer; 
+  border: 2px solid white; 
+  box-shadow: 0 0 10px rgba(168, 85, 247, 1); 
+}
