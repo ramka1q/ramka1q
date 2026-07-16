@@ -20,6 +20,7 @@ interface GameProps {
   audioBuffer: AudioBuffer;
   audioContext: AudioContext;
   videoUrl?: string | null;
+  audioFromMediaElement?: boolean;
   initialBeatmap: Note[];
   energyData: EnergyData[];
   onBack: () => void;
@@ -30,7 +31,7 @@ interface GameProps {
   onHit?: (report: HitReport) => void;
 }
 
-export default function Game({ audioBuffer, audioContext, videoUrl, initialBeatmap, energyData, onBack, isMultiplayer, serverStartTime, opponentScore, onScoreUpdate, onHit }: GameProps) {
+export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMediaElement = false, initialBeatmap, energyData, onBack, isMultiplayer, serverStartTime, opponentScore, onScoreUpdate, onHit }: GameProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const videoPreviewCanvasRef = useRef<HTMLCanvasElement>(null);
   const mobileVideoPreviewCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -160,10 +161,42 @@ export default function Game({ audioBuffer, audioContext, videoUrl, initialBeatm
     return Math.min(audioBuffer.duration, playbackRef.current.offset + elapsed);
   }, [audioBuffer.duration, getAudibleContextTime]);
 
+  const handleDirectMediaPlaybackFailure = useCallback((message: string) => {
+    if (!audioFromMediaElement) return;
+    const pauseTime = getPlaybackTime();
+    playbackGenerationRef.current += 1;
+    clearPlaybackEndTimer();
+    clearVideoStartTimer();
+    const source = sourceRef.current;
+    sourceRef.current = null;
+    if (source) {
+      source.onended = null;
+      try {
+        source.stop();
+      } catch {
+        // The silent clock may already have ended.
+      }
+      source.disconnect();
+    }
+    videoRef.current?.pause();
+    state.current.pauseTime = pauseTime;
+    state.current.currentTime = pauseTime;
+    setPlaybackState(false);
+    setCountdown(null);
+    setPlaybackError(message);
+  }, [
+    audioFromMediaElement,
+    clearPlaybackEndTimer,
+    clearVideoStartTimer,
+    getPlaybackTime,
+    setPlaybackState,
+  ]);
+
   const scheduleVideoPlayback = useCallback((startAt: number, delaySeconds: number) => {
     clearVideoStartTimer();
     const video = videoRef.current;
     if (!video || !videoUrl) return;
+    video.muted = !audioFromMediaElement;
     video.pause();
     const seekVideo = (time: number) => {
       try {
@@ -178,7 +211,10 @@ export default function Game({ audioBuffer, audioContext, videoUrl, initialBeatm
       if (!isPlayingRef.current) return;
       const targetTime = Math.min(getPlaybackTime(), Math.max(0, audioBuffer.duration - 0.001));
       if (Math.abs(video.currentTime - targetTime) > 0.03) seekVideo(targetTime);
-      void video.play().catch(() => undefined);
+      void video.play().catch((error: unknown) => {
+        console.error('Media element playback error:', error);
+        handleDirectMediaPlaybackFailure('Sound playback was blocked. Click to start.');
+      });
     };
 
     const delayMs = Math.max(0, delaySeconds * 1000);
@@ -188,7 +224,7 @@ export default function Game({ audioBuffer, audioContext, videoUrl, initialBeatm
     } else {
       startVideo();
     }
-  }, [audioBuffer.duration, clearVideoStartTimer, getPlaybackTime, videoUrl]);
+  }, [audioBuffer.duration, audioFromMediaElement, clearVideoStartTimer, getPlaybackTime, handleDirectMediaPlaybackFailure, videoUrl]);
 
   const disposeSource = useCallback(() => {
     clearPlaybackEndTimer();
@@ -454,7 +490,10 @@ export default function Game({ audioBuffer, audioContext, videoUrl, initialBeatm
             }
           }
           if (video.paused && s.currentTime < audioBuffer.duration - 0.05) {
-            void video.play().catch(() => undefined);
+            void video.play().catch((error: unknown) => {
+              console.error('Media element resume error:', error);
+              handleDirectMediaPlaybackFailure('Sound playback was blocked. Click to start.');
+            });
           }
           lastVideoSync = timestamp;
         }
@@ -695,7 +734,7 @@ export default function Game({ audioBuffer, audioContext, videoUrl, initialBeatm
 
       ctx.restore(); // Restore shake/translate
 
-      if (isMultiplayer) {
+      if (isMultiplayer && !audioFromMediaElement) {
         const previewCanvases = [videoPreviewCanvasRef.current, mobileVideoPreviewCanvasRef.current]
           .filter((candidate): candidate is HTMLCanvasElement => candidate !== null);
         previewCanvases.forEach(previewCanvas => {
@@ -775,7 +814,7 @@ export default function Game({ audioBuffer, audioContext, videoUrl, initialBeatm
     animFrameRef.current = requestAnimationFrame(loop);
 
     return () => cancelAnimationFrame(animFrameRef.current);
-  }, [audioBuffer, energyData, finishGame, getAudibleContextTime, getPlaybackTime, isEditor, isMultiplayer, isPlaying, settleHoldScore, stopAudio, videoUrl]);
+  }, [audioBuffer, audioFromMediaElement, energyData, finishGame, getAudibleContextTime, getPlaybackTime, handleDirectMediaPlaybackFailure, isEditor, isMultiplayer, isPlaying, settleHoldScore, stopAudio, videoUrl]);
 
   // Input Handling
   useEffect(() => {
@@ -1015,11 +1054,14 @@ export default function Game({ audioBuffer, audioContext, videoUrl, initialBeatm
         <video
           ref={videoRef}
           src={videoUrl}
-          muted
+          muted={!audioFromMediaElement}
           playsInline
           preload="auto"
           aria-hidden="true"
-          className="pointer-events-none absolute inset-0 h-full w-full object-cover opacity-35"
+          onError={() => handleDirectMediaPlaybackFailure('This browser cannot play the video sound. Try converting it to MP4 with AAC audio or WebM with Opus audio.')}
+          className={audioFromMediaElement
+            ? 'pointer-events-none fixed left-0 top-0 h-px w-px opacity-0'
+            : 'pointer-events-none absolute inset-0 h-full w-full object-cover opacity-35'}
         />
       )}
       <div className="absolute top-0 left-0 w-full h-full opacity-30 pointer-events-none" style={{ backgroundImage: 'radial-gradient(#ffffff 1px, transparent 1px)', backgroundSize: '40px 40px' }}></div>
@@ -1149,7 +1191,9 @@ export default function Game({ audioBuffer, audioContext, videoUrl, initialBeatm
                 <span>Opponent</span>
                 <span className="font-mono text-white">{opponentScore.score}</span>
               </div>
-              <canvas ref={mobileVideoPreviewCanvasRef} width={328} height={184} className="aspect-video w-full rounded bg-black" />
+              {!audioFromMediaElement && (
+                <canvas ref={mobileVideoPreviewCanvasRef} width={328} height={184} className="aspect-video w-full rounded bg-black" />
+              )}
             </div>
           )}
           <div className="aspect-[1/2] w-full max-w-[400px] glass relative overflow-hidden flex items-center justify-center neon-border-purple bg-black/40">
@@ -1178,7 +1222,9 @@ export default function Game({ audioBuffer, audioContext, videoUrl, initialBeatm
                 className="absolute inset-0 z-[60] flex flex-col items-center justify-center gap-4 bg-black/80 p-8 text-center backdrop-blur-sm"
               >
                 <span className="text-xl font-black uppercase tracking-widest text-red-300">{playbackError}</span>
-                <span className="rounded-xl bg-purple-600 px-6 py-3 text-sm font-black uppercase tracking-widest text-white">Start audio</span>
+                <span className="rounded-xl bg-purple-600 px-6 py-3 text-sm font-black uppercase tracking-widest text-white">
+                  {audioFromMediaElement ? 'Start without video' : 'Start audio'}
+                </span>
               </button>
             )}
             {countdown !== null && !playbackError && (
@@ -1213,11 +1259,13 @@ export default function Game({ audioBuffer, audioContext, videoUrl, initialBeatm
                 <span className="text-[10px] font-black uppercase tracking-widest text-cyan-400">Opponent</span>
               </div>
               
-              <div className="my-4 flex justify-center">
-                <div className="aspect-video w-full overflow-hidden rounded-lg border border-cyan-500/20 bg-black/60">
-                  <canvas ref={videoPreviewCanvasRef} width={640} height={360} className="h-full w-full" />
+              {!audioFromMediaElement && (
+                <div className="my-4 flex justify-center">
+                  <div className="aspect-video w-full overflow-hidden rounded-lg border border-cyan-500/20 bg-black/60">
+                    <canvas ref={videoPreviewCanvasRef} width={640} height={360} className="h-full w-full" />
+                  </div>
                 </div>
-              </div>
+              )}
 
               <div className="flex items-baseline justify-between relative z-10">
                 <span className="text-4xl font-black italic font-mono tracking-tighter text-cyan-300 drop-shadow-[0_0_10px_#22d3ee]">{opponentScore.score}</span>

@@ -33,6 +33,13 @@ export interface AudioAnalysis extends SampleAnalysis {
   buffer: AudioBuffer;
 }
 
+export class VideoAudioExtractionError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'VideoAudioExtractionError';
+  }
+}
+
 export interface PlanarAudioBuffer {
   length: number;
   numberOfChannels: number;
@@ -561,7 +568,7 @@ export const decodeMediaAudio = async (
       console.error('Browser video audio decoding failed:', nativeError);
       console.error('Media demuxer audio decoding failed:', mediaBunnyError);
       console.error('Compatibility video audio decoding failed:', compatibilityError);
-      throw new Error(
+      throw new VideoAudioExtractionError(
         'Could not extract audio from this video. Try MP4 with AAC audio or WebM with Opus audio.',
         { cause: compatibilityError },
       );

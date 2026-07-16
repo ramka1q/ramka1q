@@ -169,6 +169,16 @@ test('multiplayer rooms serialize commands and enforce lifecycle/membership', { 
   assert.match(densityMessage, /64 notes/i);
   assert.equal(densityRequestId, 'dense-create');
 
+  const playbackModeError = waitFor<[string, string]>(host, 'roomError');
+  host.emit('createRoom', {
+    ...roomPayload,
+    requestId: 'invalid-playback-mode',
+    directMediaAudio: 'yes',
+  });
+  const [playbackModeMessage, playbackModeRequestId] = await playbackModeError;
+  assert.match(playbackModeMessage, /must be a boolean/i);
+  assert.equal(playbackModeRequestId, 'invalid-playback-mode');
+
   const createdRoomIds: string[] = [];
   const echoedRequestIds: string[] = [];
   const twoRoomsCreated = new Promise<void>((resolve, reject) => {
@@ -207,11 +217,13 @@ test('multiplayer rooms serialize commands and enforce lifecycle/membership', { 
     requestId: string;
     audioBuffer: unknown;
     mimeType: string;
+    directMediaAudio: boolean;
   }]>(guest, 'roomJoined');
   guest.emit('joinRoom', { roomId: activeRoomId, requestId: 'join-active' });
   const [joinedPayload] = await joined;
   assert.equal(joinedPayload.requestId, 'join-active');
   assert.equal(joinedPayload.mimeType, 'audio/wav');
+  assert.equal(joinedPayload.directMediaAudio, false);
   assert.deepEqual(binaryBytes(joinedPayload.audioBuffer), tinyWav);
   assert.deepEqual((await hostPlayerJoined)[0], {
     roomId: activeRoomId,
@@ -324,6 +336,7 @@ test('multiplayer rooms serialize commands and enforce lifecycle/membership', { 
     ...roomPayload,
     requestId: 'alternate-host',
     mimeType: 'video/mp4',
+    directMediaAudio: true,
   });
   const [alternateRoomId, alternateRequestId] = await alternateRoomCreated;
   assert.equal(alternateRequestId, 'alternate-host');
@@ -332,10 +345,12 @@ test('multiplayer rooms serialize commands and enforce lifecycle/membership', { 
     requestId: string;
     audioBuffer: unknown;
     mimeType: string;
+    directMediaAudio: boolean;
   }]>(host, 'roomJoined');
   host.emit('joinRoom', { roomId: alternateRoomId, requestId: 'join-alternate' });
   const [alternatePayload] = await alternateJoin;
   assert.equal(alternatePayload.requestId, 'join-alternate');
   assert.equal(alternatePayload.mimeType, 'video/mp4');
+  assert.equal(alternatePayload.directMediaAudio, true);
   assert.deepEqual(binaryBytes(alternatePayload.audioBuffer), tinyWav);
 });
