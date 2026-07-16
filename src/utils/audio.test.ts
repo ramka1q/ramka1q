@@ -94,6 +94,44 @@ test('click impulses become accurately timed tap notes', () => {
   });
 });
 
+test('one extreme kick does not suppress quieter vocal-like attacks', () => {
+  const samples = new Float32Array(TONE_SAMPLE_RATE * 5);
+  const addTone = (
+    start: number,
+    length: number,
+    amplitude: number,
+    frequency: number,
+    attack: number,
+  ) => {
+    const startSample = Math.round(start * TONE_SAMPLE_RATE);
+    const endSample = Math.round((start + length) * TONE_SAMPLE_RATE);
+    for (let index = startSample; index < endSample; index++) {
+      const elapsed = index / TONE_SAMPLE_RATE - start;
+      const envelope = Math.min(1, elapsed / attack)
+        * Math.min(1, (length - elapsed) / 0.08);
+      samples[index] += amplitude * envelope
+        * Math.sin(2 * Math.PI * frequency * index / TONE_SAMPLE_RATE);
+    }
+  };
+
+  addTone(0.25, 0.03, 1, 1_100, 0.002);
+  const syllableTimes = [1, 1.45, 1.9, 2.35, 2.8, 3.25];
+  syllableTimes.forEach(time => addTone(time, 0.28, 0.13, 220, 0.06));
+
+  const { beatmap } = analyzeSamples([samples], TONE_SAMPLE_RATE, 50);
+
+  assert.ok(beatmap.some(note => Math.abs(note.time - 0.25) <= 0.03));
+  syllableTimes.forEach(time => {
+    assert.ok(
+      beatmap.some(note => note.time >= time && note.time <= time + 0.08),
+      `syllable at ${time}s should be detected`,
+    );
+  });
+  assert.ok(beatmap.length >= syllableTimes.length + 1);
+  assert.ok(beatmap.length <= syllableTimes.length + 2, 'vocal attacks should not flood the chart');
+  assert.ok(beatmap.every(note => note.duration === undefined));
+});
+
 test('a quieter sustained body remains a long note after a loud attack', () => {
   const samples = new Float32Array(TONE_SAMPLE_RATE * 3);
   const startSample = Math.round(0.5 * TONE_SAMPLE_RATE);
@@ -190,6 +228,7 @@ test('a decaying percussion tail is not treated as a held note', () => {
   const { beatmap } = analyzeSamples([samples], TONE_SAMPLE_RATE, 50);
   const attack = beatmap.find(note => Math.abs(note.time - 0.5) <= 0.03);
   assert.ok(attack);
+  assert.equal(beatmap.length, 1, 'one decaying hit must not create repeated arrows');
   assert.equal(attack.duration, undefined);
 });
 
