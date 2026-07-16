@@ -331,53 +331,23 @@ export const analyzeSamples = (
   const { means: transientMeans, deviations: transientDeviations } =
     localMeanAndDeviation(features.transient, localRadius);
   const maximumTransient = maximum(features.transient);
-  // A single mastering-scale kick must not raise the floor above quieter beat
-  // and vocal attacks for the rest of the track.
-  const robustTransient = percentile(features.transient, 0.99) || maximumTransient;
   const robustRms = percentile(features.rms, 0.95) || maximum(features.rms);
-  const deviationMultiplier = 3.5 - normalizedSensitivity * 2;
-  const globalFloorRatio = 0.08 - normalizedSensitivity * 0.045;
+  const deviationMultiplier = 3.25 - normalizedSensitivity * 2.5;
+  const globalFloorRatio = 0.075 - normalizedSensitivity * 0.06;
   const thresholds = features.transient.map((_, index) =>
     transientMeans[index]
       + transientDeviations[index] * deviationMultiplier
-      + robustTransient * globalFloorRatio,
+      + maximumTransient * globalFloorRatio,
   );
 
-  const peakRadius = Math.max(1, Math.round(0.03 / features.frameDuration));
   const onsetCandidates = features.transient.map((strength, index) => {
     if (strength <= Math.max(EPSILON, thresholds[index])) return false;
-    const start = Math.max(0, index - peakRadius);
-    const end = Math.min(features.transient.length, index + peakRadius + 1);
-    for (let nearbyIndex = start; nearbyIndex < end; nearbyIndex++) {
-      if (nearbyIndex === index) continue;
-      const nearbyStrength = features.transient[nearbyIndex];
-      if (nearbyStrength > strength || (nearbyStrength === strength && nearbyIndex < index)) {
-        return false;
-      }
-    }
-    return true;
+    const previous = index > 0 ? features.transient[index - 1] : -Infinity;
+    const next = index + 1 < features.transient.length
+      ? features.transient[index + 1]
+      : -Infinity;
+    return strength > previous && strength >= next;
   });
-  const minimumSpacing = 0.3 - normalizedSensitivity * 0.18;
-  const prioritizedOnsets = onsetCandidates
-    .map((isCandidate, frameIndex) => ({
-      frameIndex,
-      isCandidate,
-      score: (features.transient[frameIndex] - thresholds[frameIndex])
-        / (transientDeviations[frameIndex] + robustTransient * 0.01 + EPSILON),
-    }))
-    .filter(candidate => candidate.isCandidate)
-    .sort((left, right) => right.score - left.score || left.frameIndex - right.frameIndex);
-  const selectedOnsetFrames: number[] = [];
-  for (const candidate of prioritizedOnsets) {
-    const candidateTime = features.times[candidate.frameIndex];
-    if (selectedOnsetFrames.some(frameIndex => (
-      Math.abs(features.times[frameIndex] - candidateTime) + EPSILON < minimumSpacing
-    ))) {
-      continue;
-    }
-    selectedOnsetFrames.push(candidate.frameIndex);
-  }
-  selectedOnsetFrames.sort((left, right) => left - right);
 
   const rmsPrefix = prefixSums(features.rms).sums;
   const sustainLookbackFrames = Math.max(
@@ -412,12 +382,15 @@ export const analyzeSamples = (
     1,
     Math.round(SUSTAIN_SPECTRAL_BLOCK_SECONDS / features.frameDuration),
   );
+  const minimumSpacing = 0.16 - normalizedSensitivity * 0.08;
   const activeLongNotesEndTime = [0, 0, 0, 0];
   const beatmap: Note[] = [];
   let lastNoteTime = -Infinity;
   let previousLane: number | null = null;
 
-  for (const frameIndex of selectedOnsetFrames) {
+  for (let frameIndex = 0; frameIndex < onsetCandidates.length; frameIndex++) {
+    if (!onsetCandidates[frameIndex]) continue;
+
     const frameStart = features.times[frameIndex];
     const nextFrameStart = frameIndex + 1 < features.times.length
       ? features.times[frameIndex + 1]
