@@ -331,13 +331,16 @@ export const analyzeSamples = (
   const { means: transientMeans, deviations: transientDeviations } =
     localMeanAndDeviation(features.transient, localRadius);
   const maximumTransient = maximum(features.transient);
+  // A single mastering-scale kick must not raise the floor above quieter beat
+  // and vocal attacks for the rest of the track.
+  const robustTransient = percentile(features.transient, 0.99) || maximumTransient;
   const robustRms = percentile(features.rms, 0.95) || maximum(features.rms);
   const deviationMultiplier = 3.5 - normalizedSensitivity * 2;
   const globalFloorRatio = 0.08 - normalizedSensitivity * 0.045;
   const thresholds = features.transient.map((_, index) =>
     transientMeans[index]
       + transientDeviations[index] * deviationMultiplier
-      + maximumTransient * globalFloorRatio,
+      + robustTransient * globalFloorRatio,
   );
 
   const peakRadius = Math.max(1, Math.round(0.03 / features.frameDuration));
@@ -360,7 +363,7 @@ export const analyzeSamples = (
       frameIndex,
       isCandidate,
       score: (features.transient[frameIndex] - thresholds[frameIndex])
-        / (transientDeviations[frameIndex] + maximumTransient * 0.01 + EPSILON),
+        / (transientDeviations[frameIndex] + robustTransient * 0.01 + EPSILON),
     }))
     .filter(candidate => candidate.isCandidate)
     .sort((left, right) => right.score - left.score || left.frameIndex - right.frameIndex);
