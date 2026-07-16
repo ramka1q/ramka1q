@@ -33,6 +33,13 @@ export interface AudioAnalysis extends SampleAnalysis {
   buffer: AudioBuffer;
 }
 
+export interface PlanarAudioBuffer {
+  length: number;
+  numberOfChannels: number;
+  sampleRate: number;
+  getChannelData: (channel: number) => Float32Array;
+}
+
 interface FrameFeatures {
   rms: number[];
   transient: number[];
@@ -43,6 +50,34 @@ interface FrameFeatures {
 
 const clamp = (value: number, minimum: number, maximum: number) =>
   Math.min(maximum, Math.max(minimum, value));
+
+export const copyAudioChunkAtTimestamp = (
+  target: PlanarAudioBuffer,
+  chunk: PlanarAudioBuffer,
+  timestamp: number,
+): void => {
+  if (!Number.isFinite(timestamp)) throw new RangeError('timestamp must be finite');
+  if (target.sampleRate !== chunk.sampleRate) {
+    throw new RangeError('decoded audio chunks must use the target sample rate');
+  }
+
+  const signedTargetStart = Math.round(timestamp * target.sampleRate);
+  const sourceStart = Math.max(0, -signedTargetStart);
+  const targetStart = Math.max(0, signedTargetStart);
+  const copyLength = Math.min(
+    chunk.length - sourceStart,
+    target.length - targetStart,
+  );
+  if (copyLength <= 0) return;
+
+  const channelCount = Math.min(target.numberOfChannels, chunk.numberOfChannels);
+  for (let channel = 0; channel < channelCount; channel++) {
+    target.getChannelData(channel).set(
+      chunk.getChannelData(channel).subarray(sourceStart, sourceStart + copyLength),
+      targetStart,
+    );
+  }
+};
 
 const percentile = (values: readonly number[], quantile: number): number => {
   if (values.length === 0) return 0;
@@ -415,6 +450,83 @@ export const analyzeSamples = (
   return { beatmap, energyData };
 };
 
+const decodeVideoAudioTrack = async (
+  media: Blob,
+  audioContext: AudioContext,
+): Promise<AudioBuffer> => {
+  const {
+    ALL_FORMATS,
+    AudioBufferSink,
+    BlobSource,
+    Input,
+  } = await import('mediabunny');
+  const input = new Input({
+    formats: ALL_FORMATS,
+    source: new BlobSource(media),
+  });
+
+  try {
+    const audioTrack = await input.getPrimaryAudioTrack();
+    if (!audioTrack) throw new RangeError('This video does not contain an audio track.');
+    if (!await audioTrack.canDecode()) {
+      throw new RangeError(
+        'This browser cannot decode the video audio codec. Try MP4 with AAC audio or WebM with Opus audio.',
+      );
+    }
+
+    const [duration, numberOfChannels, sampleRate] = await Promise.all([
+      input.computeDuration(),
+      audioTrack.getNumberOfChannels(),
+      audioTrack.getSampleRate(),
+    ]);
+    if (!Number.isFinite(duration) || duration <= 0) {
+      throw new RangeError('The video audio track has an invalid duration.');
+    }
+    if (duration > MAX_ANALYSIS_SECONDS) {
+      throw new RangeError('Tracks longer than 25 minutes are not supported.');
+    }
+    if (!Number.isInteger(numberOfChannels) || numberOfChannels <= 0) {
+      throw new RangeError('The video audio track has an invalid channel count.');
+    }
+    if (!Number.isFinite(sampleRate) || sampleRate <= 0) {
+      throw new RangeError('The video audio track has an invalid sample rate.');
+    }
+
+    const frameCount = Math.max(1, Math.ceil(duration * sampleRate));
+    const decodedBuffer = audioContext.createBuffer(numberOfChannels, frameCount, sampleRate);
+    const sink = new AudioBufferSink(audioTrack);
+    for await (const { buffer: chunk, timestamp } of sink.buffers()) {
+      copyAudioChunkAtTimestamp(decodedBuffer, chunk, timestamp);
+    }
+    return decodedBuffer;
+  } finally {
+    input.dispose();
+  }
+};
+
+export const decodeMediaAudio = async (
+  media: Blob,
+  audioContext: AudioContext,
+  isVideo = media.type.startsWith('video/'),
+): Promise<AudioBuffer> => {
+  const encodedData = await media.arrayBuffer();
+  try {
+    return await audioContext.decodeAudioData(encodedData);
+  } catch (nativeError) {
+    if (!isVideo) throw nativeError;
+    try {
+      return await decodeVideoAudioTrack(media, audioContext);
+    } catch (fallbackError) {
+      if (fallbackError instanceof RangeError) throw fallbackError;
+      console.error('Video audio track decoding failed:', fallbackError);
+      throw new Error(
+        'Could not decode the video audio track. Try MP4 with AAC audio or WebM with Opus audio.',
+        { cause: fallbackError },
+      );
+    }
+  }
+};
+
 export const analyzeAudio = async (
   file: File,
   sensitivity: number,
@@ -429,8 +541,8 @@ export const analyzeAudio = async (
   const audioContext = new AudioContextClass();
 
   try {
-    const arrayBuffer = await file.arrayBuffer();
-    const buffer = await audioContext.decodeAudioData(arrayBuffer);
+    const isVideo = file.type.startsWith('video/') || /\.(mp4|webm)$/i.test(file.name);
+    const buffer = await decodeMediaAudio(file, audioContext, isVideo);
     if (buffer.duration > MAX_ANALYSIS_SECONDS) {
       throw new RangeError('Tracks longer than 25 minutes are not supported.');
     }

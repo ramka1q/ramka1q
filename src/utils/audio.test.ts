@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { analyzeSamples } from './audio';
+import { analyzeSamples, copyAudioChunkAtTimestamp, type PlanarAudioBuffer } from './audio';
 
 const SAMPLE_RATE = 1_000;
 const TONE_SAMPLE_RATE = 8_000;
@@ -15,6 +15,31 @@ const impulseSignal = (
   });
   return samples;
 };
+
+const planarBuffer = (
+  channels: readonly (readonly number[])[],
+  sampleRate = 10,
+): PlanarAudioBuffer => {
+  const channelData = channels.map(channel => Float32Array.from(channel));
+  return {
+    length: channelData[0]?.length ?? 0,
+    numberOfChannels: channelData.length,
+    sampleRate,
+    getChannelData: channel => channelData[channel],
+  };
+};
+
+test('decoded video audio chunks are placed by timestamp and clipped at buffer edges', () => {
+  const target = planarBuffer([[0, 0, 0, 0, 0], [0, 0, 0, 0, 0]]);
+  const positiveChunk = planarBuffer([[1, 2], [3, 4]]);
+  const negativeChunk = planarBuffer([[8, 9], [6, 7]]);
+
+  copyAudioChunkAtTimestamp(target, positiveChunk, 0.2);
+  copyAudioChunkAtTimestamp(target, negativeChunk, -0.1);
+
+  assert.deepEqual([...target.getChannelData(0)], [9, 0, 1, 2, 0]);
+  assert.deepEqual([...target.getChannelData(1)], [7, 0, 3, 4, 0]);
+});
 
 test('silence produces no notes and starts energy distance at zero', () => {
   const silence = new Float32Array(SAMPLE_RATE * 2);
