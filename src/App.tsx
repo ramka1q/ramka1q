@@ -10,8 +10,17 @@ import {
   StartGamePayload,
 } from './protocol';
 import { EnergyData, Note } from './types';
-import { analyzeAudio, decodeMediaAudio } from './utils/audio';
+import {
+  analyzeAudio,
+  decodeMediaAudio,
+  VideoAudioExtractionError,
+} from './utils/audio';
 import { normalizeBeatmap } from './utils/beatmap';
+import {
+  buildDirectMediaAnalysis,
+  createSilentPlaybackBuffer,
+  readDirectMediaDuration,
+} from './utils/direct-media';
 import { createInviteUrl, isLoopbackHostname } from './utils/invite';
 import { encodeMonoPcm16Wav, WAV_MIME_TYPE } from './utils/wav';
 
@@ -26,11 +35,19 @@ interface RoomJoinedPayload {
   energyData: unknown;
   audioBuffer: unknown;
   mimeType: unknown;
+  directMediaAudio?: unknown;
 }
 
 interface PlayerJoinedPayload {
   roomId: string;
   playerCount: number;
+}
+
+interface PendingVideoFallback {
+  file: File;
+  sensitivity: number;
+  beatmapFile?: File;
+  mode: 'single' | 'create';
 }
 
 const MAX_SHARED_VIDEO_BYTES = 32 * 1024 * 1024;
@@ -160,6 +177,7 @@ const synchronizeClock = async (socket: Socket): Promise<number> => {
 export default function App() {
   const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [directMediaAudio, setDirectMediaAudio] = useState(false);
   const [videoShareNotice, setVideoShareNotice] = useState<string | null>(null);
   const [playbackContext, setPlaybackContext] = useState<AudioContext | null>(null);
   const [beatmap, setBeatmap] = useState<Note[]>([]);
@@ -167,6 +185,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [loadingText, setLoadingText] = useState('Generating beatmap…');
   const [appError, setAppError] = useState<string | null>(null);
+  const [pendingVideoFallback, setPendingVideoFallback] = useState<PendingVideoFallback | null>(null);
 
   const [roomId, setRoomId] = useState<string | null>(null);
   const [isMultiplayer, setIsMultiplayer] = useState(false);
@@ -218,6 +237,7 @@ export default function App() {
     setRoomId(null);
     setAudioBuffer(null);
     replaceVideo(null);
+    setDirectMediaAudio(false);
     setVideoShareNotice(null);
     setPlaybackContext(null);
     setBeatmap([]);
@@ -230,6 +250,7 @@ export default function App() {
     setServerStartTime(null);
     setOpponentScore({ score: 0, combo: 0, misses: 0 });
     setIsLoading(false);
+    setPendingVideoFallback(null);
     scoreSequenceRef.current = 0;
 
     const context = playbackContextRef.current;
@@ -292,23 +313,37 @@ export default function App() {
               const sharedVideo = sharedMimeType.startsWith('video/')
                 ? new Blob([sharedMedia.slice(0)], { type: sharedMimeType })
                 : null;
-              const decodedBuffer = sharedVideo
-                ? await decodeMediaAudio(sharedVideo, context, true, message => {
-                    if (isCurrentRequest()) setLoadingText(message);
-                  })
-                : await context.decodeAudioData(sharedMedia);
+              const usesDirectMediaAudio = payload.directMediaAudio === true;
+              if (payload.directMediaAudio !== undefined
+                && typeof payload.directMediaAudio !== 'boolean') {
+                throw new TypeError('The room playback mode is invalid.');
+              }
+              if (usesDirectMediaAudio && !sharedVideo) {
+                throw new TypeError('The room direct-audio payload is not a video file.');
+              }
+              const joinedEnergyData = parseEnergyData(payload.energyData);
+              const sharedTrackDuration = joinedEnergyData[joinedEnergyData.length - 1].time;
+              const decodedBuffer = usesDirectMediaAudio
+                ? createSilentPlaybackBuffer(context, sharedTrackDuration)
+                : sharedVideo
+                  ? await decodeMediaAudio(sharedVideo, context, true, message => {
+                      if (isCurrentRequest()) setLoadingText(message);
+                    })
+                  : await context.decodeAudioData(sharedMedia);
               if (!isCurrentRequest()) {
                 socket.emit('leaveRoom', payload.roomId);
                 return;
               }
-              const joinedEnergyData = parseEnergyData(payload.energyData);
               const joinedBeatmap = normalizeBeatmap(payload.beatmap, {
                 energyData: joinedEnergyData,
-                audioDuration: decodedBuffer.duration,
+                audioDuration: usesDirectMediaAudio
+                  ? sharedTrackDuration
+                  : decodedBuffer.duration,
               });
 
               setAudioBuffer(decodedBuffer);
               replaceVideo(sharedVideo);
+              setDirectMediaAudio(usesDirectMediaAudio);
               setVideoShareNotice(null);
               setBeatmap(joinedBeatmap);
               setEnergyData(joinedEnergyData);
@@ -452,6 +487,7 @@ export default function App() {
     beatmapFile?: File,
     mode: 'single' | 'create' = 'single',
   ) => {
+    const sourceIsVideo = isVideoFile(file);
     const generation = sessionGenerationRef.current + 1;
     const requestId = mode === 'create' ? createRequestId() : null;
     sessionGenerationRef.current = generation;
@@ -460,6 +496,8 @@ export default function App() {
     scoreSequenceRef.current = 0;
     setIsLoading(true);
     setAppError(null);
+    setPendingVideoFallback(null);
+    setDirectMediaAudio(false);
     setLoadingText('Analyzing transients and generating beatmap…');
 
     try {
@@ -486,8 +524,8 @@ export default function App() {
 
       setPlaybackContext(context);
       setAudioBuffer(buffer);
-      const sourceIsVideo = isVideoFile(file);
       replaceVideo(sourceIsVideo ? file : null);
+      setDirectMediaAudio(false);
       setVideoShareNotice(null);
       setBeatmap(finalBeatmap);
       setEnergyData(generatedEnergyData);
@@ -520,6 +558,7 @@ export default function App() {
           energyData: generatedEnergyData,
           audioBuffer: sharedMedia,
           mimeType: sharedMimeType,
+          directMediaAudio: false,
         });
       } else {
         setIsMultiplayer(false);
@@ -530,7 +569,90 @@ export default function App() {
       if (generation !== sessionGenerationRef.current) return;
       console.error(error);
       resetSession(false);
+      if (sourceIsVideo && error instanceof VideoAudioExtractionError) {
+        setPendingVideoFallback({ file, sensitivity, beatmapFile, mode });
+      }
       setAppError(error instanceof Error ? error.message : 'Could not process the selected files.');
+    }
+  };
+
+  const handleStartWithoutVideo = async (fallback: PendingVideoFallback) => {
+    const { file, sensitivity, beatmapFile, mode } = fallback;
+    if (mode === 'create' && file.size > MAX_SHARED_VIDEO_BYTES) {
+      setAppError('Online play without video supports files up to 32 MiB. This file can still be played without video in solo mode.');
+      setPendingVideoFallback(fallback);
+      return;
+    }
+
+    const generation = sessionGenerationRef.current + 1;
+    const requestId = mode === 'create' ? createRequestId() : null;
+    sessionGenerationRef.current = generation;
+    pendingMultiplayerGenerationRef.current = mode === 'create' ? generation : 0;
+    pendingRequestIdRef.current = requestId;
+    scoreSequenceRef.current = 0;
+    setPendingVideoFallback(null);
+    setAppError(null);
+    setLoadingText('Preparing audio-only fallback…');
+    setIsLoading(true);
+
+    try {
+      const [context, socket, mediaDuration] = await Promise.all([
+        ensurePlaybackContext(),
+        mode === 'create' ? connectSocket() : Promise.resolve(null),
+        readDirectMediaDuration(file),
+      ]);
+      if (generation !== sessionGenerationRef.current) return;
+
+      const silentBuffer = createSilentPlaybackBuffer(context, mediaDuration);
+      const fallbackAnalysis = buildDirectMediaAnalysis(silentBuffer.duration, sensitivity);
+      let finalBeatmap = fallbackAnalysis.beatmap;
+      if (beatmapFile) {
+        const beatmapText = await beatmapFile.text();
+        if (generation !== sessionGenerationRef.current) return;
+        finalBeatmap = normalizeBeatmap(JSON.parse(beatmapText) as unknown, {
+          energyData: fallbackAnalysis.energyData,
+          audioDuration: silentBuffer.duration,
+        });
+      }
+
+      setPlaybackContext(context);
+      setAudioBuffer(silentBuffer);
+      replaceVideo(file);
+      setDirectMediaAudio(true);
+      setVideoShareNotice('Video is hidden. Sound plays directly from the original file with a fallback beatmap.');
+      setBeatmap(finalBeatmap);
+      setEnergyData(fallbackAnalysis.energyData);
+
+      if (mode === 'create' && socket) {
+        setLoadingText('Preparing shared audio-only mode…');
+        const sharedMedia = await file.arrayBuffer();
+        if (generation !== sessionGenerationRef.current
+          || requestId !== pendingRequestIdRef.current) return;
+
+        setLoadingText('Creating room…');
+        clockOffsetRef.current = await synchronizeClock(socket);
+        if (generation !== sessionGenerationRef.current
+          || requestId !== pendingRequestIdRef.current) return;
+        setIsMultiplayer(true);
+        setMultiplayerState('waiting');
+        socket.emit('createRoom', {
+          requestId,
+          beatmap: finalBeatmap,
+          energyData: fallbackAnalysis.energyData,
+          audioBuffer: sharedMedia,
+          mimeType: videoMimeType(file),
+          directMediaAudio: true,
+        });
+      } else {
+        setIsMultiplayer(false);
+        setMultiplayerState(null);
+        setIsLoading(false);
+      }
+    } catch (error) {
+      if (generation !== sessionGenerationRef.current) return;
+      console.error(error);
+      resetSession(false);
+      setAppError(error instanceof Error ? error.message : 'Could not start the video in audio-only mode.');
     }
   };
 
@@ -544,6 +666,8 @@ export default function App() {
     setLoadingText('Joining room…');
     setIsLoading(true);
     setAppError(null);
+    setPendingVideoFallback(null);
+    setDirectMediaAudio(false);
     try {
       await ensurePlaybackContext();
       if (generation !== sessionGenerationRef.current) return;
@@ -605,6 +729,8 @@ export default function App() {
   const nativeShare = (navigator as unknown as {
     share?: (data?: ShareData) => Promise<void>;
   }).share;
+  const fallbackMustBeSolo = pendingVideoFallback?.mode === 'create'
+    && pendingVideoFallback.file.size > MAX_SHARED_VIDEO_BYTES;
 
   const handleCopyInvite = async () => {
     if (!inviteUrl || inviteIsLocal) return;
@@ -640,9 +766,28 @@ export default function App() {
   return (
     <div className="min-h-[100dvh] bg-gray-950 font-sans text-white selection:bg-purple-500/30">
       {appError && (
-        <div role="alert" className="fixed left-1/2 top-4 z-[70] flex w-[min(92vw,42rem)] -translate-x-1/2 items-center justify-between gap-4 rounded-xl border border-red-400/30 bg-red-950/95 px-5 py-4 text-sm text-red-100 shadow-2xl backdrop-blur">
-          <span>{appError}</span>
-          <button type="button" onClick={() => setAppError(null)} aria-label="Dismiss error" className="rounded p-1 hover:bg-white/10">
+        <div role="alert" className="fixed left-1/2 top-4 z-[70] flex w-[min(92vw,42rem)] -translate-x-1/2 flex-wrap items-center justify-between gap-4 rounded-xl border border-red-400/30 bg-red-950/95 px-5 py-4 text-sm text-red-100 shadow-2xl backdrop-blur">
+          <span className="min-w-0 flex-1">{appError}</span>
+          {pendingVideoFallback && (
+            <button
+              type="button"
+              onClick={() => void handleStartWithoutVideo(fallbackMustBeSolo
+                ? { ...pendingVideoFallback, mode: 'single' }
+                : pendingVideoFallback)}
+              className="rounded-lg bg-cyan-400 px-4 py-2 text-xs font-black uppercase tracking-wider text-gray-950 transition hover:bg-cyan-300"
+            >
+              {fallbackMustBeSolo ? 'Play solo without video' : 'Play without video'}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              setAppError(null);
+              setPendingVideoFallback(null);
+            }}
+            aria-label="Dismiss error"
+            className="rounded p-1 hover:bg-white/10"
+          >
             <X className="h-4 w-4" />
           </button>
         </div>
@@ -669,7 +814,7 @@ export default function App() {
             <>
               <h2 className="mb-3 text-4xl font-black text-white">ROOM READY</h2>
               <p className="mb-6 max-w-xl text-base text-gray-300 sm:text-lg">
-                Send this invite to your friend. The synchronized track{videoUrl && !videoShareNotice ? ' and video download' : ' downloads'} automatically.
+                Send this invite to your friend. The synchronized track{videoUrl && !videoShareNotice && !directMediaAudio ? ' and video download' : ' downloads'} automatically.
               </p>
               {videoShareNotice && (
                 <div role="status" className="mb-6 max-w-xl rounded-xl border border-amber-400/40 bg-amber-500/10 px-5 py-4 text-sm text-amber-100">
@@ -727,7 +872,7 @@ export default function App() {
             <>
               <h2 className="mb-3 text-4xl font-black text-white">TRACK READY</h2>
               <p className="mb-6 max-w-xl text-lg text-gray-300">
-                The host&apos;s {videoUrl ? 'video and audio are' : 'audio is'} already downloaded. You do not need to select a file.
+                The host&apos;s {videoUrl && !directMediaAudio ? 'video and audio are' : 'audio is'} already downloaded. You do not need to select a file.
               </p>
               <div className="mb-7 rounded-xl border border-cyan-500/30 bg-black/40 px-6 py-3 font-mono text-2xl font-bold text-cyan-300">
                 {roomId || '…'}
@@ -745,6 +890,7 @@ export default function App() {
           audioBuffer={audioBuffer}
           audioContext={playbackContext}
           videoUrl={videoUrl}
+          audioFromMediaElement={directMediaAudio}
           initialBeatmap={beatmap}
           energyData={energyData}
           onBack={() => resetSession(true)}
