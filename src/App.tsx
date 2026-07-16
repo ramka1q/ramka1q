@@ -10,7 +10,7 @@ import {
   StartGamePayload,
 } from './protocol';
 import { EnergyData, Note } from './types';
-import { analyzeAudio } from './utils/audio';
+import { analyzeAudio, decodeMediaAudio } from './utils/audio';
 import { normalizeBeatmap } from './utils/beatmap';
 import { createInviteUrl, isLoopbackHostname } from './utils/invite';
 import { encodeMonoPcm16Wav, WAV_MIME_TYPE } from './utils/wav';
@@ -292,7 +292,9 @@ export default function App() {
               const sharedVideo = sharedMimeType.startsWith('video/')
                 ? new Blob([sharedMedia.slice(0)], { type: sharedMimeType })
                 : null;
-              const decodedBuffer = await context.decodeAudioData(sharedMedia);
+              const decodedBuffer = sharedVideo
+                ? await decodeMediaAudio(sharedVideo, context, true)
+                : await context.decodeAudioData(sharedMedia);
               if (!isCurrentRequest()) {
                 socket.emit('leaveRoom', payload.roomId);
                 return;
