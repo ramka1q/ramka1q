@@ -1,5 +1,5 @@
 import React, { useRef, useState } from 'react';
-import { FileJson, Music, UploadCloud, Users } from 'lucide-react';
+import { FileJson, Music, Sparkles, UploadCloud, Users } from 'lucide-react';
 import {
   normalizeRoomCode,
   ROOM_CODE_PATTERN,
@@ -19,15 +19,16 @@ const isAudioLikeFile = (file: File) => {
 const isJsonFile = (file: File) => file.type === 'application/json' || file.name.toLowerCase().endsWith('.json');
 
 interface SetupProps {
-  onStart: (file: File, sensitivity: number, beatmapFile?: File) => void;
-  onCreate: (file: File, sensitivity: number, beatmapFile?: File) => void;
-  onJoin: (roomId: string) => void;
+  onStart: (file: File, sensitivity: number, beatmapFile: File | undefined, experimentalEffects: boolean) => void;
+  onCreate: (file: File, sensitivity: number, beatmapFile: File | undefined, experimentalEffects: boolean) => void;
+  onJoin: (roomId: string, experimentalEffects: boolean) => void;
 }
 
 export default function Setup({ onStart, onCreate, onJoin }: SetupProps) {
   const [file, setFile] = useState<File | null>(null);
   const [beatmapFile, setBeatmapFile] = useState<File | null>(null);
   const [sensitivity, setSensitivity] = useState(50);
+  const [experimentalEffects, setExperimentalEffects] = useState(true);
   const [isDragging, setIsDragging] = useState(false);
   const [invitedRoomId] = useState(() =>
     typeof window === 'undefined' ? null : roomCodeFromSearch(window.location.search));
@@ -98,6 +99,36 @@ export default function Setup({ onStart, onCreate, onJoin }: SetupProps) {
           <p className="text-[10px] uppercase tracking-widest text-gray-400 font-bold">Adaptive Rhythm Analysis Engine</p>
         </div>
 
+        <div className="relative z-10 mb-6 flex items-center justify-between gap-4 rounded-xl border border-fuchsia-400/25 bg-fuchsia-500/10 p-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-fuchsia-200">
+              <Sparkles className="h-4 w-4 shrink-0" />
+              <span className="text-[10px] font-black uppercase tracking-widest">Experimental events</span>
+            </div>
+            <p className="mt-1 text-[10px] leading-relaxed text-gray-400">
+              Animated lane swaps and arrow rushes during quiet breaks.
+            </p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={experimentalEffects}
+            aria-label="Experimental rhythm events"
+            onClick={() => setExperimentalEffects(enabled => !enabled)}
+            className={`relative h-7 w-12 shrink-0 rounded-full border transition-colors ${
+              experimentalEffects
+                ? 'border-fuchsia-300/70 bg-fuchsia-500/70'
+                : 'border-gray-600 bg-gray-800'
+            }`}
+          >
+            <span
+              className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-lg transition-transform ${
+                experimentalEffects ? 'translate-x-5' : 'translate-x-0.5'
+              }`}
+            />
+          </button>
+        </div>
+
         {invitedRoomId && (
           <div className="relative z-10 mb-6 rounded-xl border border-cyan-400/40 bg-cyan-500/10 p-4 text-center">
             <p className="text-xs font-black uppercase tracking-widest text-cyan-200">
@@ -108,7 +139,7 @@ export default function Setup({ onStart, onCreate, onJoin }: SetupProps) {
             </p>
             <button
               type="button"
-              onClick={() => onJoin(invitedRoomId)}
+              onClick={() => onJoin(invitedRoomId, experimentalEffects)}
               className="mt-4 w-full rounded-lg bg-cyan-500 px-4 py-3 text-sm font-black uppercase tracking-widest text-gray-950 transition hover:bg-cyan-300"
             >
               Join &amp; enable sound
@@ -203,7 +234,7 @@ export default function Setup({ onStart, onCreate, onJoin }: SetupProps) {
         <div className="mt-8 space-y-3 relative z-10">
           <button
             type="button"
-            onClick={() => file && onStart(file, sensitivity, beatmapFile || undefined)}
+            onClick={() => file && onStart(file, sensitivity, beatmapFile || undefined, experimentalEffects)}
             disabled={!file}
             className="w-full py-3 glass bg-purple-600/20 hover:bg-purple-600/40 text-sm font-black uppercase tracking-widest transition-all neon-border-purple disabled:opacity-50 disabled:cursor-not-allowed text-white flex items-center justify-center gap-2"
           >
@@ -212,7 +243,7 @@ export default function Setup({ onStart, onCreate, onJoin }: SetupProps) {
           
           <button
             type="button"
-            onClick={() => file && onCreate(file, sensitivity, beatmapFile || undefined)}
+            onClick={() => file && onCreate(file, sensitivity, beatmapFile || undefined, experimentalEffects)}
             disabled={!file}
             className="w-full py-3 glass bg-cyan-600/20 hover:bg-cyan-600/40 text-sm font-black uppercase tracking-widest transition-all neon-border-cyan disabled:opacity-50 disabled:cursor-not-allowed text-white flex items-center justify-center gap-2"
           >
@@ -220,7 +251,7 @@ export default function Setup({ onStart, onCreate, onJoin }: SetupProps) {
           </button>
           {file && (
             <p className="text-center text-[10px] font-bold uppercase tracking-wide text-gray-400">
-              Videos up to 32 MiB are shared; larger files send optimized audio only
+              Video files are used for sound only; multiplayer sends synchronized audio
             </p>
           )}
         </div>
@@ -240,7 +271,9 @@ export default function Setup({ onStart, onCreate, onJoin }: SetupProps) {
             className="flex gap-2"
             onSubmit={(event) => {
               event.preventDefault();
-              if (ROOM_CODE_PATTERN.test(normalizedJoinId)) onJoin(normalizedJoinId);
+              if (ROOM_CODE_PATTERN.test(normalizedJoinId)) {
+                onJoin(normalizedJoinId, experimentalEffects);
+              }
             }}
           >
             <input 

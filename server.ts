@@ -83,7 +83,7 @@ interface Room {
   notesById: Map<string, BeatmapNote>;
   audioBuffer: Buffer;
   mimeType: string;
-  directMediaAudio: boolean;
+  experimentalEffects: boolean;
   storageBytes: number;
   state: RoomState;
   startTime?: number;
@@ -97,7 +97,7 @@ interface RoomJoinedPayload {
   energyData: EnergyPoint[];
   audioBuffer: Buffer;
   mimeType: string;
-  directMediaAudio: boolean;
+  experimentalEffects: boolean;
 }
 
 interface ClientToServerEvents {
@@ -144,7 +144,7 @@ interface ValidatedCreateRoomPayload {
   energyData: EnergyPoint[];
   audioBuffer: Buffer;
   mimeType: string;
-  directMediaAudio: boolean;
+  experimentalEffects: boolean;
 }
 
 class ClientPayloadError extends Error {}
@@ -393,10 +393,10 @@ function parseMimeType(value: unknown): string {
   return mimeType;
 }
 
-function parseDirectMediaAudio(value: unknown): boolean {
+function parseExperimentalEffects(value: unknown): boolean {
   if (value === undefined) return false;
   if (typeof value !== "boolean") {
-    throw new ClientPayloadError("directMediaAudio must be a boolean.");
+    throw new ClientPayloadError("experimentalEffects must be a boolean.");
   }
   return value;
 }
@@ -431,17 +431,14 @@ function parseCreateRoomPayload(value: unknown): ValidatedCreateRoomPayload {
     throw new ClientPayloadError("beatmap notes must fit inside the analyzed track.");
   }
   const mimeType = parseMimeType(payload.mimeType);
-  const directMediaAudio = parseDirectMediaAudio(payload.directMediaAudio);
-  if (directMediaAudio && !mimeType.startsWith("video/")) {
-    throw new ClientPayloadError("Direct media audio requires a video payload.");
-  }
+  const experimentalEffects = parseExperimentalEffects(payload.experimentalEffects);
   return {
     requestId,
     beatmap,
     energyData,
     audioBuffer: parseAudioBuffer(payload.audioBuffer),
     mimeType,
-    directMediaAudio,
+    experimentalEffects,
   };
 }
 
@@ -903,7 +900,7 @@ async function startServer(): Promise<void> {
           notesById: new Map(payload.beatmap.map(note => [note.id, note])),
           audioBuffer: payload.audioBuffer,
           mimeType: payload.mimeType,
-          directMediaAudio: payload.directMediaAudio,
+          experimentalEffects: payload.experimentalEffects,
           storageBytes: roomStorageBytes,
           state: "waiting",
           lastActivityAt: Date.now(),
@@ -982,7 +979,7 @@ async function startServer(): Promise<void> {
           energyData: room.energyData,
           audioBuffer: room.audioBuffer,
           mimeType: room.mimeType,
-          directMediaAudio: room.directMediaAudio,
+          experimentalEffects: room.experimentalEffects,
         });
         io.to(roomId).emit("playerJoined", {
           roomId,
