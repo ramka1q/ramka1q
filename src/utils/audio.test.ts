@@ -129,9 +129,68 @@ test('transient accents do not cut off an uninterrupted sustained tone', () => {
   }
 
   const { beatmap } = analyzeSamples([samples], TONE_SAMPLE_RATE, 50);
+  const holds = beatmap.filter(note => (note.duration ?? 0) >= 0.5);
   const longestHold = Math.max(0, ...beatmap.map(note => note.duration ?? 0));
 
+  assert.equal(holds.length, 1, 'one sustained source should create one hold');
   assert.ok(longestHold >= 2, 'accents inside a continuous sound should preserve a hold');
+});
+
+test('a percussion attack over a continuous backing bed remains a tap', () => {
+  const samples = new Float32Array(TONE_SAMPLE_RATE * 3);
+  const attackStart = Math.round(0.5 * TONE_SAMPLE_RATE);
+  const attackEnd = Math.round(0.53 * TONE_SAMPLE_RATE);
+
+  for (let index = 0; index < samples.length; index++) {
+    const time = index / TONE_SAMPLE_RATE;
+    const backingAmplitude = time < 0.5 ? 0.08 : 0.13;
+    samples[index] = backingAmplitude * Math.sin(2 * Math.PI * 220 * time);
+    if (index >= attackStart && index < attackEnd) {
+      samples[index] += 0.8 * Math.sin(2 * Math.PI * 1_200 * time);
+    }
+  }
+
+  const { beatmap } = analyzeSamples([samples], TONE_SAMPLE_RATE, 50);
+  const attack = beatmap.find(note => Math.abs(note.time - 0.5) <= 0.03);
+  assert.ok(attack, 'the percussion attack should still be detected');
+  assert.equal(attack.duration, undefined, 'the backing bed must not become its tail');
+});
+
+test('repeated percussion attacks over a backing bed never merge into holds', () => {
+  const samples = new Float32Array(TONE_SAMPLE_RATE * 4);
+  const attackTimes = [0.5, 1, 1.5, 2, 2.5, 3];
+
+  for (let index = 0; index < samples.length; index++) {
+    const time = index / TONE_SAMPLE_RATE;
+    samples[index] = 0.11 * Math.sin(2 * Math.PI * 180 * time);
+  }
+  attackTimes.forEach(attackTime => {
+    const start = Math.round(attackTime * TONE_SAMPLE_RATE);
+    const end = Math.round((attackTime + 0.03) * TONE_SAMPLE_RATE);
+    for (let index = start; index < end; index++) {
+      const time = index / TONE_SAMPLE_RATE;
+      samples[index] += 0.8 * Math.sin(2 * Math.PI * 1_100 * time);
+    }
+  });
+
+  const { beatmap } = analyzeSamples([samples], TONE_SAMPLE_RATE, 50);
+  assert.ok(beatmap.length >= attackTimes.length - 1, 'the main attacks should remain playable');
+  assert.ok(beatmap.every(note => note.duration === undefined));
+});
+
+test('a decaying percussion tail is not treated as a held note', () => {
+  const samples = new Float32Array(TONE_SAMPLE_RATE * 2);
+  const start = Math.round(0.5 * TONE_SAMPLE_RATE);
+  for (let index = start; index < samples.length; index++) {
+    const elapsed = (index - start) / TONE_SAMPLE_RATE;
+    const amplitude = 0.9 * Math.exp(-elapsed / 0.18);
+    samples[index] = amplitude * Math.sin(2 * Math.PI * 900 * index / TONE_SAMPLE_RATE);
+  }
+
+  const { beatmap } = analyzeSamples([samples], TONE_SAMPLE_RATE, 50);
+  const attack = beatmap.find(note => Math.abs(note.time - 0.5) <= 0.03);
+  assert.ok(attack);
+  assert.equal(attack.duration, undefined);
 });
 
 test('a tap followed only by a very quiet background does not become a hold', () => {
@@ -165,10 +224,14 @@ test('dense staccato bursts stay separate instead of merging into holds', () => 
   const { beatmap } = analyzeSamples([samples], TONE_SAMPLE_RATE, 50);
 
   assert.ok(beatmap.length >= 5, 'the staccato attacks should remain playable notes');
+  assert.ok(beatmap.length <= 7, 'default density should keep a playable subset of the burst');
   assert.ok(
     beatmap.every(note => (note.duration ?? 0) < 0.3),
     'short separated bursts must not become long notes',
   );
+
+  const expertBeatmap = analyzeSamples([samples], TONE_SAMPLE_RATE, 100).beatmap;
+  assert.ok(expertBeatmap.length >= 10, 'expert density should retain the rapid pattern');
 });
 
 test('high sensitivity does not duplicate one continuous tone into overlapping holds', () => {

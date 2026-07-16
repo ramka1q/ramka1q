@@ -39,6 +39,33 @@ test('does not create events for a track without a loud-to-quiet transition', ()
   assert.deepEqual(detectExperimentalEvents(steadyTrack, 60), []);
 });
 
+test('detects the same break in a dynamically mastered track', () => {
+  const source = energyTrack(50, time => {
+    if (time >= 10 && time < 18) return 0.9;
+    if (time >= 18 && time < 24) return 0.2;
+    return 0.48;
+  });
+  const mastered = source.map(point => ({
+    ...point,
+    energy: 0.35 + point.energy * 0.65,
+  }));
+
+  const sourceEvents = detectExperimentalEvents(source, 50);
+  const masteredEvents = detectExperimentalEvents(mastered, 50);
+  assert.equal(sourceEvents.length, 1);
+  assert.equal(masteredEvents.length, 1);
+  assert.equal(masteredEvents[0].time, sourceEvents[0].time);
+});
+
+test('ignores a shallow mastered dip that is not a real quiet break', () => {
+  const track = energyTrack(50, time => {
+    if (time >= 10 && time < 18) return 0.86;
+    if (time >= 18 && time < 24) return 0.74;
+    return 0.78;
+  });
+  assert.deepEqual(detectExperimentalEvents(track, 50), []);
+});
+
 test('lane swaps animate in and back without changing logical lane values', () => {
   const event = detectExperimentalEvents(energyTrack(30, time => {
     if (time >= 9 && time < 16) return 0.9;

@@ -11,9 +11,16 @@ const SUSTAIN_BODY_FLOOR_RATIO = 0.75;
 const SUSTAIN_MIN_ATTACK_RATIO = 0.08;
 const SUSTAIN_GAP_TOLERANCE_SECONDS = 0.06;
 const SUSTAIN_REARTICULATION_GAP_SECONDS = 0.02;
-const OVERLAPPING_HOLD_LOOKBACK_SECONDS = 0.05;
-const OVERLAPPING_HOLD_RISE_RATIO = 1.3;
-const MIN_HOLD_SECONDS = 0.3;
+const SUSTAIN_LATE_BODY_START_SECONDS = 0.32;
+const SUSTAIN_LATE_BODY_WINDOW_SECONDS = 0.2;
+const SUSTAIN_BASELINE_RISE_RATIO = 1.18;
+const SUSTAIN_LATE_BODY_RATIO = 0.62;
+const SUSTAIN_SPECTRAL_FACTOR_LIMIT = 1.75;
+const SUSTAIN_MIN_SPECTRAL_RATIO = 0.015;
+const SUSTAIN_SPECTRAL_MAD_LIMIT = 0.2;
+const SUSTAIN_SPECTRAL_BLOCK_SECONDS = 0.1;
+const SUSTAIN_SPECTRAL_BLOCK_DEVIATION_LIMIT = 0.22;
+const MIN_HOLD_SECONDS = 0.5;
 const MAX_HOLD_SECONDS = 3;
 const MAX_AUDIO_FILE_BYTES = 100 * 1024 * 1024;
 const MAX_ANALYSIS_SECONDS = 25 * 60;
@@ -50,6 +57,7 @@ export interface PlanarAudioBuffer {
 interface FrameFeatures {
   rms: number[];
   transient: number[];
+  spectralRatio: number[];
   times: number[];
   duration: number;
   frameDuration: number;
@@ -176,6 +184,7 @@ const extractFrameFeatures = (
   const rms = new Array<number>(frameCount);
   const differenceRms = new Array<number>(frameCount);
   const transient = new Array<number>(frameCount);
+  const spectralRatio = new Array<number>(frameCount);
   const times = new Array<number>(frameCount);
   const previousSamples = new Array<number>(channels.length).fill(0);
 
@@ -211,11 +220,17 @@ const extractFrameFeatures = (
     const rmsRise = Math.max(0, rms[frameIndex] - previousRms);
     const differenceRise = Math.max(0, differenceRms[frameIndex] - previousDifferenceRms);
     transient[frameIndex] = rmsRise + differenceRise * 0.35;
+    // The first-difference/RMS ratio is a cheap, sample-rate-independent proxy
+    // for spectral character. A sustained source should keep it reasonably stable.
+    spectralRatio[frameIndex] = rms[frameIndex] > EPSILON
+      ? differenceRms[frameIndex] / rms[frameIndex]
+      : 0;
   }
 
   return {
     rms,
     transient,
+    spectralRatio,
     times,
     duration: sampleCount / sampleRate,
     frameDuration,
@@ -317,22 +332,49 @@ export const analyzeSamples = (
     localMeanAndDeviation(features.transient, localRadius);
   const maximumTransient = maximum(features.transient);
   const robustRms = percentile(features.rms, 0.95) || maximum(features.rms);
-  const deviationMultiplier = 3.25 - normalizedSensitivity * 2.5;
-  const globalFloorRatio = 0.075 - normalizedSensitivity * 0.06;
+  const deviationMultiplier = 3.5 - normalizedSensitivity * 2;
+  const globalFloorRatio = 0.08 - normalizedSensitivity * 0.045;
   const thresholds = features.transient.map((_, index) =>
     transientMeans[index]
       + transientDeviations[index] * deviationMultiplier
       + maximumTransient * globalFloorRatio,
   );
 
+  const peakRadius = Math.max(1, Math.round(0.03 / features.frameDuration));
   const onsetCandidates = features.transient.map((strength, index) => {
     if (strength <= Math.max(EPSILON, thresholds[index])) return false;
-    const previous = index > 0 ? features.transient[index - 1] : -Infinity;
-    const next = index + 1 < features.transient.length
-      ? features.transient[index + 1]
-      : -Infinity;
-    return strength > previous && strength >= next;
+    const start = Math.max(0, index - peakRadius);
+    const end = Math.min(features.transient.length, index + peakRadius + 1);
+    for (let nearbyIndex = start; nearbyIndex < end; nearbyIndex++) {
+      if (nearbyIndex === index) continue;
+      const nearbyStrength = features.transient[nearbyIndex];
+      if (nearbyStrength > strength || (nearbyStrength === strength && nearbyIndex < index)) {
+        return false;
+      }
+    }
+    return true;
   });
+  const minimumSpacing = 0.3 - normalizedSensitivity * 0.18;
+  const prioritizedOnsets = onsetCandidates
+    .map((isCandidate, frameIndex) => ({
+      frameIndex,
+      isCandidate,
+      score: (features.transient[frameIndex] - thresholds[frameIndex])
+        / (transientDeviations[frameIndex] + maximumTransient * 0.01 + EPSILON),
+    }))
+    .filter(candidate => candidate.isCandidate)
+    .sort((left, right) => right.score - left.score || left.frameIndex - right.frameIndex);
+  const selectedOnsetFrames: number[] = [];
+  for (const candidate of prioritizedOnsets) {
+    const candidateTime = features.times[candidate.frameIndex];
+    if (selectedOnsetFrames.some(frameIndex => (
+      Math.abs(features.times[frameIndex] - candidateTime) + EPSILON < minimumSpacing
+    ))) {
+      continue;
+    }
+    selectedOnsetFrames.push(candidate.frameIndex);
+  }
+  selectedOnsetFrames.sort((left, right) => left - right);
 
   const rmsPrefix = prefixSums(features.rms).sums;
   const sustainLookbackFrames = Math.max(
@@ -355,19 +397,24 @@ export const analyzeSamples = (
     1,
     Math.round(SUSTAIN_REARTICULATION_GAP_SECONDS / features.frameDuration),
   );
-  const overlappingHoldLookbackFrames = Math.max(
+  const sustainLateBodyStartFrames = Math.max(
     1,
-    Math.round(OVERLAPPING_HOLD_LOOKBACK_SECONDS / features.frameDuration),
+    Math.round(SUSTAIN_LATE_BODY_START_SECONDS / features.frameDuration),
   );
-  const minimumSpacing = 0.16 - normalizedSensitivity * 0.08;
+  const sustainLateBodyWindowFrames = Math.max(
+    1,
+    Math.round(SUSTAIN_LATE_BODY_WINDOW_SECONDS / features.frameDuration),
+  );
+  const sustainSpectralBlockFrames = Math.max(
+    1,
+    Math.round(SUSTAIN_SPECTRAL_BLOCK_SECONDS / features.frameDuration),
+  );
   const activeLongNotesEndTime = [0, 0, 0, 0];
   const beatmap: Note[] = [];
   let lastNoteTime = -Infinity;
   let previousLane: number | null = null;
 
-  for (let frameIndex = 0; frameIndex < onsetCandidates.length; frameIndex++) {
-    if (!onsetCandidates[frameIndex]) continue;
-
+  for (const frameIndex of selectedOnsetFrames) {
     const frameStart = features.times[frameIndex];
     const nextFrameStart = frameIndex + 1 < features.times.length
       ? features.times[frameIndex + 1]
@@ -389,11 +436,6 @@ export const analyzeSamples = (
     const precedingRms = lookbackCount > 0
       ? (rmsPrefix[frameIndex] - rmsPrefix[lookbackStart]) / lookbackCount
       : 0;
-    const recentLookbackStart = Math.max(0, frameIndex - overlappingHoldLookbackFrames);
-    const recentLookbackCount = frameIndex - recentLookbackStart;
-    const recentRms = recentLookbackCount > 0
-      ? (rmsPrefix[frameIndex] - rmsPrefix[recentLookbackStart]) / recentLookbackCount
-      : 0;
     const bodyWindowStart = Math.min(
       features.rms.length,
       frameIndex + sustainBodyDelayFrames,
@@ -405,6 +447,34 @@ export const analyzeSamples = (
     const bodyRms = percentile(
       features.rms.slice(bodyWindowStart, bodyWindowEnd),
       0.25,
+    );
+    const bodySpectralRatio = percentile(
+      features.spectralRatio.slice(bodyWindowStart, bodyWindowEnd),
+      0.5,
+    );
+    const lateBodyWindowStart = Math.min(
+      features.rms.length,
+      frameIndex + sustainLateBodyStartFrames,
+    );
+    const lateBodyWindowEnd = Math.min(
+      features.rms.length,
+      lateBodyWindowStart + sustainLateBodyWindowFrames,
+    );
+    const lateBodyRms = percentile(
+      features.rms.slice(lateBodyWindowStart, lateBodyWindowEnd),
+      0.25,
+    );
+    const attackSpectralRatio = features.spectralRatio[frameIndex];
+    const lowerSpectralRatio = Math.min(attackSpectralRatio, bodySpectralRatio);
+    const upperSpectralRatio = Math.max(attackSpectralRatio, bodySpectralRatio);
+    const spectralFactor = upperSpectralRatio / Math.max(lowerSpectralRatio, EPSILON);
+    const hasSpectralContinuity = lowerSpectralRatio < SUSTAIN_MIN_SPECTRAL_RATIO
+      || spectralFactor <= SUSTAIN_SPECTRAL_FACTOR_LIMIT;
+    const risesAboveBaseline = precedingRms <= EPSILON
+      || bodyRms >= precedingRms * SUSTAIN_BASELINE_RISE_RATIO;
+    const hasStableLateBody = lateBodyRms >= Math.max(
+      bodyRms * SUSTAIN_LATE_BODY_RATIO,
+      precedingRms * SUSTAIN_BASELINE_RISE_RATIO,
     );
     const sustainFloor = Math.max(
       Math.max(
@@ -424,14 +494,31 @@ export const analyzeSamples = (
       const forwardTime = features.times[forwardIndex];
       if (forwardTime - noteTime > MAX_HOLD_SECONDS + features.frameDuration) break;
 
-      // Other transients can coexist with a sustained sound in a mixed track.
-      // End the hold only when the RMS envelope actually falls away.
       if (features.rms[forwardIndex] >= sustainFloor) {
         if (
           gapFrames >= minimumRearticulationGapFrames
           && onsetCandidates[forwardIndex]
         ) {
           break;
+        }
+        if (onsetCandidates[forwardIndex] && forwardIndex >= bodyWindowEnd) {
+          const rearticulationSpectralRatio = features.spectralRatio[forwardIndex];
+          const lowerRearticulationRatio = Math.min(
+            bodySpectralRatio,
+            rearticulationSpectralRatio,
+          );
+          const upperRearticulationRatio = Math.max(
+            bodySpectralRatio,
+            rearticulationSpectralRatio,
+          );
+          const rearticulationFactor = upperRearticulationRatio
+            / Math.max(lowerRearticulationRatio, EPSILON);
+          if (
+            lowerRearticulationRatio >= SUSTAIN_MIN_SPECTRAL_RATIO
+            && rearticulationFactor > SUSTAIN_SPECTRAL_FACTOR_LIMIT
+          ) {
+            break;
+          }
         }
         lastSustainFrame = forwardIndex;
         gapFrames = 0;
@@ -441,15 +528,64 @@ export const analyzeSamples = (
       }
     }
 
+    if (bodySpectralRatio >= SUSTAIN_MIN_SPECTRAL_RATIO) {
+      let unstableSpectralBlocks = 0;
+      for (
+        let blockStart = bodyWindowEnd;
+        blockStart <= lastSustainFrame;
+        blockStart += sustainSpectralBlockFrames
+      ) {
+        const blockEnd = Math.min(
+          lastSustainFrame + 1,
+          blockStart + sustainSpectralBlockFrames,
+        );
+        const blockSpectralRatio = percentile(
+          features.spectralRatio
+            .slice(blockStart, blockEnd)
+            .filter(value => value >= SUSTAIN_MIN_SPECTRAL_RATIO),
+          0.5,
+        );
+        const relativeDeviation = blockSpectralRatio > EPSILON
+          ? Math.abs(blockSpectralRatio - bodySpectralRatio) / bodySpectralRatio
+          : 0;
+        unstableSpectralBlocks = relativeDeviation > SUSTAIN_SPECTRAL_BLOCK_DEVIATION_LIMIT
+          ? unstableSpectralBlocks + 1
+          : 0;
+        if (unstableSpectralBlocks >= 2) {
+          lastSustainFrame = Math.max(
+            frameIndex,
+            blockStart - sustainSpectralBlockFrames - 1,
+          );
+          break;
+        }
+      }
+    }
+
     const sustainEnd = Math.min(
       features.duration,
       (lastSustainFrame + 1) * features.frameDuration,
     );
     const possibleDuration = Math.max(0, sustainEnd - noteTime);
-    const isDistinctSustainedLayer = recentRms <= EPSILON
-      || features.rms[frameIndex] >= recentRms * OVERLAPPING_HOLD_RISE_RATIO;
+    const sustainedSpectralRatios = features.spectralRatio
+      .slice(bodyWindowStart, lastSustainFrame + 1)
+      .filter(value => value >= SUSTAIN_MIN_SPECTRAL_RATIO);
+    const sustainedSpectralMedian = percentile(sustainedSpectralRatios, 0.5);
+    const sustainedSpectralMad = sustainedSpectralMedian > EPSILON
+      ? percentile(
+          sustainedSpectralRatios.map(value => (
+            Math.abs(value - sustainedSpectralMedian) / sustainedSpectralMedian
+          )),
+          0.5,
+        )
+      : 0;
+    const hasStableSpectralBody = sustainedSpectralRatios.length === 0
+      || sustainedSpectralMad <= SUSTAIN_SPECTRAL_MAD_LIMIT;
     const duration = possibleDuration >= MIN_HOLD_SECONDS
-      && (!overlapsActiveHold || isDistinctSustainedLayer)
+      && !overlapsActiveHold
+      && risesAboveBaseline
+      && hasStableLateBody
+      && hasSpectralContinuity
+      && hasStableSpectralBody
       ? Math.min(MAX_HOLD_SECONDS, possibleDuration)
       : 0;
     const lane = deterministicLane(frameIndex, beatmap.length, availableLanes, previousLane);
