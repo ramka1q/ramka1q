@@ -316,4 +316,26 @@ test('multiplayer rooms serialize commands and enforce lifecycle/membership', { 
   const [destroyedMessage, destroyedRequestId] = await destroyedRoomError;
   assert.match(destroyedMessage, /not found/i);
   assert.equal(destroyedRequestId, 'join-destroyed');
+
+  // Hosting belongs to the socket that creates a room; it is not restricted to
+  // the player that hosted an earlier room. Video media is relayed unchanged.
+  const alternateRoomCreated = waitFor<[string, string]>(outsider, 'roomCreated');
+  outsider.emit('createRoom', {
+    ...roomPayload,
+    requestId: 'alternate-host',
+    mimeType: 'video/mp4',
+  });
+  const [alternateRoomId, alternateRequestId] = await alternateRoomCreated;
+  assert.equal(alternateRequestId, 'alternate-host');
+
+  const alternateJoin = waitFor<[{
+    requestId: string;
+    audioBuffer: unknown;
+    mimeType: string;
+  }]>(host, 'roomJoined');
+  host.emit('joinRoom', { roomId: alternateRoomId, requestId: 'join-alternate' });
+  const [alternatePayload] = await alternateJoin;
+  assert.equal(alternatePayload.requestId, 'join-alternate');
+  assert.equal(alternatePayload.mimeType, 'video/mp4');
+  assert.deepEqual(binaryBytes(alternatePayload.audioBuffer), tinyWav);
 });

@@ -5,7 +5,6 @@ import Game from './components/Game';
 import Setup from './components/Setup';
 import {
   HitReport,
-  OpponentHitPayload,
   ScoreSnapshot,
   ScoreUpdatePayload,
   StartGamePayload,
@@ -26,12 +25,24 @@ interface RoomJoinedPayload {
   beatmap: unknown;
   energyData: unknown;
   audioBuffer: unknown;
+  mimeType: unknown;
 }
 
 interface PlayerJoinedPayload {
   roomId: string;
   playerCount: number;
 }
+
+const MAX_SHARED_VIDEO_BYTES = 32 * 1024 * 1024;
+
+const isVideoFile = (file: File): boolean =>
+  file.type.startsWith('video/') || /\.(mp4|webm)$/i.test(file.name);
+
+const videoMimeType = (file: File): string => {
+  if (file.type.startsWith('video/')) return file.type;
+  if (/\.webm$/i.test(file.name)) return 'video/webm';
+  return 'video/mp4';
+};
 
 const createRequestId = (): string => {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
@@ -148,6 +159,8 @@ const synchronizeClock = async (socket: Socket): Promise<number> => {
 
 export default function App() {
   const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [videoShareNotice, setVideoShareNotice] = useState<string | null>(null);
   const [playbackContext, setPlaybackContext] = useState<AudioContext | null>(null);
   const [beatmap, setBeatmap] = useState<Note[]>([]);
   const [energyData, setEnergyData] = useState<EnergyData[]>([]);
@@ -163,7 +176,6 @@ export default function App() {
   const [inviteCopyState, setInviteCopyState] = useState<InviteCopyState>('idle');
   const [serverStartTime, setServerStartTime] = useState<number | null>(null);
   const [opponentScore, setOpponentScore] = useState<ScoreSnapshot>({ score: 0, combo: 0, misses: 0 });
-  const [opponentLastHit, setOpponentLastHit] = useState<number | null>(null);
 
   const socketRef = useRef<Socket | null>(null);
   const socketConnectionRef = useRef<Promise<Socket> | null>(null);
@@ -174,6 +186,15 @@ export default function App() {
   const pendingMultiplayerGenerationRef = useRef(0);
   const pendingRequestIdRef = useRef<string | null>(null);
   const scoreSequenceRef = useRef(0);
+  const videoUrlRef = useRef<string | null>(null);
+
+  const replaceVideo = useCallback((blob: Blob | null) => {
+    const previousUrl = videoUrlRef.current;
+    const nextUrl = blob ? URL.createObjectURL(blob) : null;
+    videoUrlRef.current = nextUrl;
+    setVideoUrl(nextUrl);
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
+  }, []);
 
   const ensurePlaybackContext = useCallback(async () => {
     let context = playbackContextRef.current;
@@ -196,6 +217,8 @@ export default function App() {
     pendingRequestIdRef.current = null;
     setRoomId(null);
     setAudioBuffer(null);
+    replaceVideo(null);
+    setVideoShareNotice(null);
     setPlaybackContext(null);
     setBeatmap([]);
     setEnergyData([]);
@@ -206,14 +229,13 @@ export default function App() {
     setInviteCopyState('idle');
     setServerStartTime(null);
     setOpponentScore({ score: 0, combo: 0, misses: 0 });
-    setOpponentLastHit(null);
     setIsLoading(false);
     scoreSequenceRef.current = 0;
 
     const context = playbackContextRef.current;
     playbackContextRef.current = null;
     if (context && context.state !== 'closed') void context.close().catch(() => undefined);
-  }, []);
+  }, [replaceVideo]);
 
   const connectSocket = useCallback(async (): Promise<Socket> => {
     const existing = socketRef.current;
@@ -263,7 +285,14 @@ export default function App() {
                 socket.emit('leaveRoom', payload.roomId);
                 return;
               }
-              const decodedBuffer = await context.decodeAudioData(toArrayBuffer(payload.audioBuffer));
+              const sharedMedia = toArrayBuffer(payload.audioBuffer);
+              const sharedMimeType = typeof payload.mimeType === 'string'
+                ? payload.mimeType.trim().toLowerCase()
+                : '';
+              const sharedVideo = sharedMimeType.startsWith('video/')
+                ? new Blob([sharedMedia.slice(0)], { type: sharedMimeType })
+                : null;
+              const decodedBuffer = await context.decodeAudioData(sharedMedia);
               if (!isCurrentRequest()) {
                 socket.emit('leaveRoom', payload.roomId);
                 return;
@@ -275,6 +304,8 @@ export default function App() {
               });
 
               setAudioBuffer(decodedBuffer);
+              replaceVideo(sharedVideo);
+              setVideoShareNotice(null);
               setBeatmap(joinedBeatmap);
               setEnergyData(joinedEnergyData);
               setIsMultiplayer(true);
@@ -317,12 +348,6 @@ export default function App() {
           if (data && Number.isFinite(data.score) && Number.isFinite(data.combo) && Number.isFinite(data.misses)) {
             setOpponentScore(data);
           }
-        });
-
-        socket.on('opponentHit', ({ lane }: OpponentHitPayload) => {
-          if (!Number.isInteger(lane) || lane < 0 || lane > 3) return;
-          setOpponentLastHit(lane);
-          window.setTimeout(() => setOpponentLastHit(null), 60);
         });
 
         socket.on('playerJoined', (payload: PlayerJoinedPayload) => {
@@ -406,7 +431,7 @@ export default function App() {
     } finally {
       socketConnectionRef.current = null;
     }
-  }, [ensurePlaybackContext, resetSession]);
+  }, [ensurePlaybackContext, replaceVideo, resetSession]);
 
   useEffect(() => () => {
     sessionGenerationRef.current += 1;
@@ -414,6 +439,7 @@ export default function App() {
     socketRef.current?.disconnect();
     const context = playbackContextRef.current;
     if (context && context.state !== 'closed') void context.close().catch(() => undefined);
+    if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current);
   }, []);
 
   const handleStart = async (
@@ -454,15 +480,27 @@ export default function App() {
 
       setPlaybackContext(context);
       setAudioBuffer(buffer);
+      const sourceIsVideo = isVideoFile(file);
+      replaceVideo(sourceIsVideo ? file : null);
+      setVideoShareNotice(null);
       setBeatmap(finalBeatmap);
       setEnergyData(generatedEnergyData);
 
       if (mode === 'create' && socket) {
-        setLoadingText('Optimizing shared audio…');
+        const canShareVideo = sourceIsVideo && file.size <= MAX_SHARED_VIDEO_BYTES;
+        setLoadingText(canShareVideo ? 'Preparing shared video…' : 'Optimizing shared audio…');
         await new Promise<void>(resolve => window.setTimeout(resolve, 0));
         if (generation !== sessionGenerationRef.current
           || requestId !== pendingRequestIdRef.current) return;
-        const encodedAudio = encodeMonoPcm16Wav(buffer);
+        const sharedMedia = canShareVideo
+          ? await file.arrayBuffer()
+          : encodeMonoPcm16Wav(buffer);
+        if (generation !== sessionGenerationRef.current
+          || requestId !== pendingRequestIdRef.current) return;
+        const sharedMimeType = canShareVideo ? videoMimeType(file) : WAV_MIME_TYPE;
+        if (sourceIsVideo && !canShareVideo) {
+          setVideoShareNotice('The video is over 32 MiB, so your friend will receive synchronized audio without the video.');
+        }
 
         setLoadingText('Creating room…');
         clockOffsetRef.current = await synchronizeClock(socket);
@@ -474,8 +512,8 @@ export default function App() {
           requestId,
           beatmap: finalBeatmap,
           energyData: generatedEnergyData,
-          audioBuffer: encodedAudio,
-          mimeType: WAV_MIME_TYPE,
+          audioBuffer: sharedMedia,
+          mimeType: sharedMimeType,
         });
       } else {
         setIsMultiplayer(false);
@@ -625,8 +663,13 @@ export default function App() {
             <>
               <h2 className="mb-3 text-4xl font-black text-white">ROOM READY</h2>
               <p className="mb-6 max-w-xl text-base text-gray-300 sm:text-lg">
-                Send this invite to your friend. The track downloads automatically, so they do not need your audio or video file.
+                Send this invite to your friend. The synchronized track{videoUrl && !videoShareNotice ? ' and video download' : ' downloads'} automatically.
               </p>
+              {videoShareNotice && (
+                <div role="status" className="mb-6 max-w-xl rounded-xl border border-amber-400/40 bg-amber-500/10 px-5 py-4 text-sm text-amber-100">
+                  {videoShareNotice}
+                </div>
+              )}
               <div className="mb-6 flex min-h-20 items-center justify-center rounded-xl border border-cyan-500/30 bg-black/50 px-8 py-4 font-mono text-4xl font-bold text-cyan-400 shadow-[0_0_30px_rgba(34,211,238,0.2)] sm:text-5xl">
                 {roomId || '…'}
               </div>
@@ -678,7 +721,7 @@ export default function App() {
             <>
               <h2 className="mb-3 text-4xl font-black text-white">TRACK READY</h2>
               <p className="mb-6 max-w-xl text-lg text-gray-300">
-                The host&apos;s audio is already downloaded. You do not need to select or receive any file.
+                The host&apos;s {videoUrl ? 'video and audio are' : 'audio is'} already downloaded. You do not need to select a file.
               </p>
               <div className="mb-7 rounded-xl border border-cyan-500/30 bg-black/40 px-6 py-3 font-mono text-2xl font-bold text-cyan-300">
                 {roomId || '…'}
@@ -695,6 +738,7 @@ export default function App() {
         <Game
           audioBuffer={audioBuffer}
           audioContext={playbackContext}
+          videoUrl={videoUrl}
           initialBeatmap={beatmap}
           energyData={energyData}
           onBack={() => resetSession(true)}
@@ -703,7 +747,6 @@ export default function App() {
           opponentScore={opponentScore}
           onScoreUpdate={handleScoreUpdate}
           onHit={handleHit}
-          opponentLastHit={opponentLastHit}
         />
       )}
     </div>

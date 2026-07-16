@@ -14,10 +14,54 @@ export interface HoldScoreConfig {
   pointsPerTick: number;
 }
 
+export interface AudibleClockEstimate {
+  currentTime: number;
+  performanceNow: number;
+  outputTimestamp?: {
+    contextTime?: number;
+    performanceTime?: number;
+  };
+  outputLatency?: number;
+  baseLatency?: number;
+}
+
 export const DEFAULT_HOLD_SCORE_CONFIG: Readonly<HoldScoreConfig> = Object.freeze({
   tickSeconds: 0.05,
   pointsPerTick: 6,
 });
+
+/** Estimates the AudioContext time that has actually reached the output device. */
+export const estimateAudibleContextTime = ({
+  currentTime,
+  performanceNow,
+  outputTimestamp,
+  outputLatency = 0,
+  baseLatency = 0,
+}: AudibleClockEstimate): number => {
+  const timestampContextTime = outputTimestamp?.contextTime;
+  const timestampPerformanceTime = outputTimestamp?.performanceTime;
+  if (
+    typeof timestampContextTime === 'number'
+    && Number.isFinite(timestampContextTime)
+    && timestampContextTime >= 0
+    && typeof timestampPerformanceTime === 'number'
+    && Number.isFinite(timestampPerformanceTime)
+    && timestampPerformanceTime > 0
+  ) {
+    const projectedContextTime = timestampContextTime
+      + Math.max(0, performanceNow - timestampPerformanceTime) / 1000;
+    if (projectedContextTime <= currentTime + 0.25) {
+      return Math.min(currentTime, Math.max(0, projectedContextTime));
+    }
+  }
+
+  const latency = Number.isFinite(outputLatency) && outputLatency > 0
+    ? outputLatency
+    : Number.isFinite(baseLatency) && baseLatency > 0
+      ? baseLatency
+      : 0;
+  return Math.max(0, currentTime - latency);
+};
 
 /** Returns the closest pending note in the requested lane and inclusive hit window. */
 export const findClosestHittableNote = (
