@@ -48,6 +48,8 @@ interface FrameFeatures {
   frameDuration: number;
 }
 
+class TrackDurationError extends RangeError {}
+
 const clamp = (value: number, minimum: number, maximum: number) =>
   Math.min(maximum, Math.max(minimum, value));
 
@@ -77,6 +79,23 @@ export const copyAudioChunkAtTimestamp = (
       targetStart,
     );
   }
+};
+
+export const decodePcm16LeMono = (bytes: Uint8Array): Float32Array => {
+  if (bytes.byteLength === 0) {
+    throw new RangeError('The decoded audio track is empty.');
+  }
+  if (bytes.byteLength % 2 !== 0) {
+    throw new RangeError('The decoded PCM audio has an invalid byte length.');
+  }
+
+  const samples = new Float32Array(bytes.byteLength / 2);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (let index = 0; index < samples.length; index++) {
+    const value = view.getInt16(index * 2, true);
+    samples[index] = value < 0 ? value / 0x8000 : value / 0x7fff;
+  }
+  return samples;
 };
 
 const percentile = (values: readonly number[], quantile: number): number => {
@@ -467,7 +486,7 @@ const decodeVideoAudioTrack = async (
 
   try {
     const audioTrack = await input.getPrimaryAudioTrack();
-    if (!audioTrack) throw new RangeError('This video does not contain an audio track.');
+    if (!audioTrack) throw new Error('The fast decoder could not detect an audio track.');
     if (!await audioTrack.canDecode()) {
       throw new RangeError(
         'This browser cannot decode the video audio codec. Try MP4 with AAC audio or WebM with Opus audio.',
@@ -483,7 +502,7 @@ const decodeVideoAudioTrack = async (
       throw new RangeError('The video audio track has an invalid duration.');
     }
     if (duration > MAX_ANALYSIS_SECONDS) {
-      throw new RangeError('Tracks longer than 25 minutes are not supported.');
+      throw new TrackDurationError('Tracks longer than 25 minutes are not supported.');
     }
     if (!Number.isInteger(numberOfChannels) || numberOfChannels <= 0) {
       throw new RangeError('The video audio track has an invalid channel count.');
@@ -508,20 +527,43 @@ export const decodeMediaAudio = async (
   media: Blob,
   audioContext: AudioContext,
   isVideo = media.type.startsWith('video/'),
+  onCompatibilityFallback?: (message: string) => void,
 ): Promise<AudioBuffer> => {
   const encodedData = await media.arrayBuffer();
   try {
     return await audioContext.decodeAudioData(encodedData);
   } catch (nativeError) {
     if (!isVideo) throw nativeError;
+
+    let mediaBunnyError: unknown;
     try {
       return await decodeVideoAudioTrack(media, audioContext);
-    } catch (fallbackError) {
-      if (fallbackError instanceof RangeError) throw fallbackError;
-      console.error('Video audio track decoding failed:', fallbackError);
+    } catch (error) {
+      if (error instanceof TrackDurationError) throw error;
+      mediaBunnyError = error;
+    }
+
+    onCompatibilityFallback?.('Loading compatibility video decoder (this may take a moment)…');
+    try {
+      const { extractVideoAudioPcm, OUTPUT_SAMPLE_RATE } = await import('./ffmpeg-audio');
+      const pcmBytes = await extractVideoAudioPcm(media);
+      const samples = decodePcm16LeMono(pcmBytes);
+      const duration = samples.length / OUTPUT_SAMPLE_RATE;
+      if (duration > MAX_ANALYSIS_SECONDS) {
+        throw new TrackDurationError('Tracks longer than 25 minutes are not supported.');
+      }
+
+      const decodedBuffer = audioContext.createBuffer(1, samples.length, OUTPUT_SAMPLE_RATE);
+      decodedBuffer.getChannelData(0).set(samples);
+      return decodedBuffer;
+    } catch (compatibilityError) {
+      if (compatibilityError instanceof TrackDurationError) throw compatibilityError;
+      console.error('Browser video audio decoding failed:', nativeError);
+      console.error('Media demuxer audio decoding failed:', mediaBunnyError);
+      console.error('Compatibility video audio decoding failed:', compatibilityError);
       throw new Error(
-        'Could not decode the video audio track. Try MP4 with AAC audio or WebM with Opus audio.',
-        { cause: fallbackError },
+        'Could not extract audio from this video. Try MP4 with AAC audio or WebM with Opus audio.',
+        { cause: compatibilityError },
       );
     }
   }
@@ -530,6 +572,7 @@ export const decodeMediaAudio = async (
 export const analyzeAudio = async (
   file: File,
   sensitivity: number,
+  onCompatibilityFallback?: (message: string) => void,
 ): Promise<AudioAnalysis> => {
   if (file.size <= 0) throw new RangeError('The audio file is empty.');
   if (file.size > MAX_AUDIO_FILE_BYTES) {
@@ -542,7 +585,7 @@ export const analyzeAudio = async (
 
   try {
     const isVideo = file.type.startsWith('video/') || /\.(mp4|webm)$/i.test(file.name);
-    const buffer = await decodeMediaAudio(file, audioContext, isVideo);
+    const buffer = await decodeMediaAudio(file, audioContext, isVideo, onCompatibilityFallback);
     if (buffer.duration > MAX_ANALYSIS_SECONDS) {
       throw new RangeError('Tracks longer than 25 minutes are not supported.');
     }

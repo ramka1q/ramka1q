@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { analyzeSamples, copyAudioChunkAtTimestamp, type PlanarAudioBuffer } from './audio';
+import {
+  analyzeSamples,
+  copyAudioChunkAtTimestamp,
+  decodePcm16LeMono,
+  type PlanarAudioBuffer,
+} from './audio';
 
 const SAMPLE_RATE = 1_000;
 const TONE_SAMPLE_RATE = 8_000;
@@ -39,6 +44,23 @@ test('decoded video audio chunks are placed by timestamp and clipped at buffer e
 
   assert.deepEqual([...target.getChannelData(0)], [9, 0, 1, 2, 0]);
   assert.deepEqual([...target.getChannelData(1)], [7, 0, 3, 4, 0]);
+});
+
+test('compatibility PCM decoder converts signed little-endian samples', () => {
+  const pcm = Uint8Array.from([
+    0x00, 0x80,
+    0x00, 0xc0,
+    0x00, 0x00,
+    0xff, 0x3f,
+    0xff, 0x7f,
+  ]);
+
+  const decoded = decodePcm16LeMono(pcm);
+  assert.deepEqual([...decoded.slice(0, 3)], [-1, -0.5, 0]);
+  assert.ok(Math.abs(decoded[3] - 16_383 / 32_767) < 1e-7);
+  assert.equal(decoded[4], 1);
+  assert.throws(() => decodePcm16LeMono(new Uint8Array()), /empty/);
+  assert.throws(() => decodePcm16LeMono(Uint8Array.of(1)), /byte length/);
 });
 
 test('silence produces no notes and starts energy distance at zero', () => {
