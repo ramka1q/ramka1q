@@ -116,6 +116,83 @@ test('a quieter sustained body remains a long note after a loud attack', () => {
   );
 });
 
+test('a consonant-like attack flows into one sustained vowel hold', () => {
+  const samples = new Float32Array(TONE_SAMPLE_RATE * 2.5);
+  const attackStart = Math.round(0.5 * TONE_SAMPLE_RATE);
+  const vowelStart = Math.round(0.55 * TONE_SAMPLE_RATE);
+  const vowelEnd = Math.round(1.8 * TONE_SAMPLE_RATE);
+
+  for (let index = attackStart; index < vowelStart; index++) {
+    samples[index] = 0.75 * Math.sin(2 * Math.PI * 1_400 * index / TONE_SAMPLE_RATE);
+  }
+  for (let index = vowelStart; index < vowelEnd; index++) {
+    samples[index] = 0.2 * Math.sin(2 * Math.PI * 220 * index / TONE_SAMPLE_RATE);
+  }
+
+  const { beatmap } = analyzeSamples([samples], TONE_SAMPLE_RATE, 50);
+  const onset = beatmap.find(note => Math.abs(note.time - 0.5) <= 0.04);
+
+  assert.ok(onset);
+  assert.ok((onset.duration ?? 0) >= 1.1, 'the attack and vowel should form one hold');
+});
+
+test('a quiet sustained voice remains a hold over a loud backing tone', () => {
+  const samples = new Float32Array(TONE_SAMPLE_RATE * 2.5);
+  for (let index = 0; index < samples.length; index++) {
+    const time = index / TONE_SAMPLE_RATE;
+    samples[index] = 0.25 * Math.sin(2 * Math.PI * 180 * time);
+    if (time >= 0.5 && time < 1.8) {
+      const voiceAmplitude = time < 0.53 ? 0.5 : 0.11;
+      samples[index] += voiceAmplitude * Math.sin(2 * Math.PI * 440 * time);
+    }
+  }
+
+  const { beatmap } = analyzeSamples([samples], TONE_SAMPLE_RATE, 50);
+  const onset = beatmap.find(note => Math.abs(note.time - 0.5) <= 0.04);
+
+  assert.ok(onset, 'the quieter added voice should still create an onset');
+  assert.ok((onset.duration ?? 0) >= 1.1, 'the quieter voice should remain a hold');
+});
+
+test('short percussion accents do not cut off a sustained vowel', () => {
+  const samples = new Float32Array(TONE_SAMPLE_RATE * 3);
+  const vowelStart = Math.round(0.5 * TONE_SAMPLE_RATE);
+  const vowelEnd = Math.round(2.5 * TONE_SAMPLE_RATE);
+  for (let index = vowelStart; index < vowelEnd; index++) {
+    samples[index] = 0.24 * Math.sin(2 * Math.PI * 220 * index / TONE_SAMPLE_RATE);
+  }
+  [0.9, 1.3, 1.7, 2.1].forEach(time => {
+    const start = Math.round(time * TONE_SAMPLE_RATE);
+    const end = Math.round((time + 0.025) * TONE_SAMPLE_RATE);
+    for (let index = start; index < end; index++) {
+      samples[index] += 0.75 * Math.sin(2 * Math.PI * 1_200 * index / TONE_SAMPLE_RATE);
+    }
+  });
+
+  const { beatmap } = analyzeSamples([samples], TONE_SAMPLE_RATE, 50);
+  const vowel = beatmap.find(note => Math.abs(note.time - 0.5) <= 0.04);
+
+  assert.ok(vowel);
+  assert.ok((vowel.duration ?? 0) >= 1.8, 'brief accents must not split the held vowel');
+});
+
+test('a musical note slightly over 400 ms becomes a hold', () => {
+  const samples = new Float32Array(TONE_SAMPLE_RATE * 1.5);
+  const start = Math.round(0.5 * TONE_SAMPLE_RATE);
+  const end = Math.round(0.95 * TONE_SAMPLE_RATE);
+  for (let index = start; index < end; index++) {
+    const elapsed = (index - start) / TONE_SAMPLE_RATE;
+    const amplitude = elapsed < 0.03 ? 0.8 : 0.22;
+    samples[index] = amplitude * Math.sin(2 * Math.PI * 330 * index / TONE_SAMPLE_RATE);
+  }
+
+  const { beatmap } = analyzeSamples([samples], TONE_SAMPLE_RATE, 50);
+  const onset = beatmap.find(note => Math.abs(note.time - 0.5) <= 0.04);
+
+  assert.ok(onset);
+  assert.ok((onset.duration ?? 0) >= 0.4);
+});
+
 test('transient accents do not cut off an uninterrupted sustained tone', () => {
   const samples = new Float32Array(TONE_SAMPLE_RATE * 4);
   const startSample = Math.round(0.5 * TONE_SAMPLE_RATE);
