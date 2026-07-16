@@ -14,7 +14,9 @@ export interface ExperimentalEvent {
 const SAMPLE_STEP_SECONDS = 0.25;
 const MIN_EVENT_TIME_SECONDS = 7;
 const MIN_EVENT_GAP_SECONDS = 18;
+const LOCAL_CANDIDATE_WINDOW_SECONDS = 2;
 const QUIET_LOOKAHEAD_SECONDS = 1.5;
+const MAX_EVENT_DURATION_SECONDS = 3;
 const DEFAULT_LANE_ORDER = [0, 1, 2, 3] as const;
 const LANE_ORDERS = [
   [3, 2, 1, 0],
@@ -26,6 +28,12 @@ const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
 const smoothstep = (value: number) => {
   const progress = clamp01(value);
   return progress * progress * (3 - 2 * progress);
+};
+
+const percentile = (values: readonly number[], quantile: number): number => {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.floor((sorted.length - 1) * clamp01(quantile))];
 };
 
 const sampleWindow = (
@@ -61,16 +69,26 @@ export const detectExperimentalEvents = (
   if (availableDuration < MIN_EVENT_TIME_SECONDS + QUIET_LOOKAHEAD_SECONDS + 1) return [];
 
   const maximumEvents = Math.min(5, Math.max(1, Math.ceil(availableDuration / 45)));
-  const events: ExperimentalEvent[] = [];
-  let lastEventTime = -Infinity;
+  const energyValues = energyData.map(point => point.energy);
+  const lowerQuartile = percentile(energyValues, 0.25);
+  const median = percentile(energyValues, 0.5);
+  const upperQuartile = percentile(energyValues, 0.75);
+  const spread = Math.max(0, upperQuartile - lowerQuartile);
+  const quietCeiling = Math.min(
+    median,
+    lowerQuartile + Math.max(0.04, spread * 0.15),
+  );
+  const loudFloor = Math.max(median * 0.82, quietCeiling);
+  const peakFloor = Math.max(loudFloor, upperQuartile * 0.85);
+  const averageDropFloor = Math.min(0.24, Math.max(0.14, spread * 0.55));
+  const immediateDropFloor = Math.min(0.2, Math.max(0.12, spread * 0.45));
+  const candidates: { transitionTime: number; eventTime: number; strength: number }[] = [];
 
   for (
     let transitionTime = MIN_EVENT_TIME_SECONDS;
-    transitionTime <= availableDuration - QUIET_LOOKAHEAD_SECONDS - 1;
+    transitionTime <= availableDuration - MAX_EVENT_DURATION_SECONDS - 0.35;
     transitionTime += SAMPLE_STEP_SECONDS
   ) {
-    if (transitionTime - lastEventTime < MIN_EVENT_GAP_SECONDS) continue;
-
     const before = sampleWindow(energyData, transitionTime - 2.5, transitionTime - 0.5);
     const after = sampleWindow(
       energyData,
@@ -79,13 +97,36 @@ export const detectExperimentalEvents = (
     );
     const immediateBefore = energyAtTime(energyData, transitionTime - 0.2);
     const immediateAfter = energyAtTime(energyData, transitionTime + 0.35);
-    const isLoudSection = before.average >= 0.58 && before.peak >= 0.72;
-    const isQuietBreak = after.average <= 0.38;
-    const isSharpEnoughDrop = before.average - after.average >= 0.24
-      && immediateBefore - immediateAfter >= 0.18;
+    const averageDrop = before.average - after.average;
+    const immediateDrop = immediateBefore - immediateAfter;
+    const isLoudSection = before.average >= loudFloor && before.peak >= peakFloor;
+    const isQuietBreak = after.average <= quietCeiling
+      && after.average / Math.max(before.average, 1e-9) <= 0.82;
+    const isSharpEnoughDrop = averageDrop >= averageDropFloor
+      && immediateDrop >= immediateDropFloor;
     if (!isLoudSection || !isQuietBreak || !isSharpEnoughDrop) continue;
 
-    const eventTime = transitionTime + 0.35;
+    candidates.push({
+      transitionTime,
+      eventTime: transitionTime + 0.35,
+      strength: averageDrop + immediateDrop * 0.35,
+    });
+  }
+
+  const strongestLocalCandidates = candidates.filter((candidate, index) => (
+    !candidates.some((other, otherIndex) => (
+      otherIndex !== index
+      && Math.abs(other.transitionTime - candidate.transitionTime) <= LOCAL_CANDIDATE_WINDOW_SECONDS
+      && (other.strength > candidate.strength
+        || (other.strength === candidate.strength && other.transitionTime < candidate.transitionTime))
+    ))
+  ));
+  const events: ExperimentalEvent[] = [];
+  let lastEventTime = -Infinity;
+
+  for (const candidate of strongestLocalCandidates) {
+    const { eventTime } = candidate;
+    if (eventTime - lastEventTime < MIN_EVENT_GAP_SECONDS) continue;
     const kind: ExperimentalEventKind = events.length % 2 === 0
       ? 'lane-swap'
       : 'arrow-flight';
