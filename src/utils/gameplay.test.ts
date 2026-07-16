@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Note } from '../types';
-import { cumulativeHoldScore, findClosestHittableNote } from './gameplay';
+import {
+  cumulativeHoldScore,
+  estimateAudibleContextTime,
+  findClosestHittableNote,
+} from './gameplay';
 
 const note = (id: string, time: number, lane = 0): Note => ({
   id,
@@ -28,6 +32,27 @@ test('findClosestHittableNote ignores completed notes and breaks ties earlier', 
 
   const match = findClosestHittableNote([later, alreadyHit, earlier], 0, 1, 0.11);
   assert.equal(match?.note.id, 'earlier');
+});
+
+test('audible clock follows the output timestamp instead of running ahead with Web Audio', () => {
+  const audibleTime = estimateAudibleContextTime({
+    currentTime: 1,
+    performanceNow: 1_050,
+    outputTimestamp: { contextTime: 0.84, performanceTime: 1_000 },
+    outputLatency: 0.2,
+    baseLatency: 0.01,
+  });
+
+  assert.ok(Math.abs(audibleTime - 0.89) < 1e-12);
+});
+
+test('audible clock falls back to device output latency', () => {
+  assert.equal(estimateAudibleContextTime({
+    currentTime: 1,
+    performanceNow: 1_000,
+    outputLatency: 0.12,
+    baseLatency: 0.01,
+  }), 0.88);
 });
 
 const simulateHoldAtFps = (fps: number, duration: number): number => {

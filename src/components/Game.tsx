@@ -2,7 +2,11 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Note, GameState, EnergyData } from '../types';
 import { formatTime } from '../utils/audio';
 import { distanceAtTime, energyAtTime, timeAtDistance } from '../utils/beatmap';
-import { cumulativeHoldScore, findClosestHittableNote } from '../utils/gameplay';
+import {
+  cumulativeHoldScore,
+  estimateAudibleContextTime,
+  findClosestHittableNote,
+} from '../utils/gameplay';
 import type { HitReport } from '../protocol';
 import { Play, Pause, ArrowLeft, Edit3, Save } from 'lucide-react';
 
@@ -15,6 +19,7 @@ const HIT_WINDOWS = { sick: 0.045, good: 0.090, bad: 0.135 };
 interface GameProps {
   audioBuffer: AudioBuffer;
   audioContext: AudioContext;
+  videoUrl?: string | null;
   initialBeatmap: Note[];
   energyData: EnergyData[];
   onBack: () => void;
@@ -23,18 +28,21 @@ interface GameProps {
   opponentScore?: { score: number; combo: number; misses: number };
   onScoreUpdate?: (score: number, combo: number, misses: number) => void;
   onHit?: (report: HitReport) => void;
-  opponentLastHit?: number | null;
 }
 
-export default function Game({ audioBuffer, audioContext, initialBeatmap, energyData, onBack, isMultiplayer, serverStartTime, opponentScore, onScoreUpdate, onHit, opponentLastHit }: GameProps) {
+export default function Game({ audioBuffer, audioContext, videoUrl, initialBeatmap, energyData, onBack, isMultiplayer, serverStartTime, opponentScore, onScoreUpdate, onHit }: GameProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const opponentCanvasRef = useRef<HTMLCanvasElement>(null);
+  const videoPreviewCanvasRef = useRef<HTMLCanvasElement>(null);
+  const mobileVideoPreviewCanvasRef = useRef<HTMLCanvasElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
   const pointerLanesRef = useRef(new Map<number, number>());
   
   // A single Web Audio clock drives playback, rendering, and hit judgement.
   const sourceRef = useRef<AudioBufferSourceNode | null>(null);
   const playbackRef = useRef({ contextStartTime: 0, offset: 0 });
   const playbackGenerationRef = useRef(0);
+  const videoStartTimerRef = useRef<number | null>(null);
+  const playbackEndTimerRef = useRef<number | null>(null);
   const isPlayingRef = useRef(false);
   const hasFinishedRef = useRef(false);
   
@@ -63,22 +71,25 @@ export default function Game({ audioBuffer, audioContext, initialBeatmap, energy
     holdScoreBaselines: {} as Record<string, number>,
   });
   
-  const oppState = useRef({
-    keyEffects: [0, 0, 0, 0],
-  });
-
   const animFrameRef = useRef<number>(0);
-
-  // Opponent hits
-  useEffect(() => {
-    if (opponentLastHit !== null && opponentLastHit !== undefined) {
-      oppState.current.keyEffects[opponentLastHit] = 1.0;
-    }
-  }, [opponentLastHit]);
 
   const setPlaybackState = useCallback((playing: boolean) => {
     isPlayingRef.current = playing;
     setIsPlaying(playing);
+  }, []);
+
+  const clearVideoStartTimer = useCallback(() => {
+    if (videoStartTimerRef.current !== null) {
+      window.clearTimeout(videoStartTimerRef.current);
+      videoStartTimerRef.current = null;
+    }
+  }, []);
+
+  const clearPlaybackEndTimer = useCallback(() => {
+    if (playbackEndTimerRef.current !== null) {
+      window.clearTimeout(playbackEndTimerRef.current);
+      playbackEndTimerRef.current = null;
+    }
   }, []);
 
   const settleHoldScore = useCallback((note: Note, throughTime: number) => {
@@ -119,17 +130,68 @@ export default function Game({ audioBuffer, audioContext, initialBeatmap, energy
 
     currentState.currentTime = Math.min(audioBuffer.duration, finishTime);
     currentState.pauseTime = currentState.currentTime;
+    clearPlaybackEndTimer();
+    clearVideoStartTimer();
+    videoRef.current?.pause();
     setPlaybackState(false);
     setIsGameOver(true);
-  }, [audioBuffer.duration, setPlaybackState, settleHoldScore]);
+  }, [audioBuffer.duration, clearPlaybackEndTimer, clearVideoStartTimer, setPlaybackState, settleHoldScore]);
+
+  const getAudibleContextTime = useCallback(() => {
+    const currentContextTime = audioContext.currentTime;
+    let outputTimestamp: AudioTimestamp | undefined;
+    try {
+      outputTimestamp = audioContext.getOutputTimestamp?.();
+    } catch {
+      // Some browsers expose getOutputTimestamp but cannot use it yet.
+    }
+    return estimateAudibleContextTime({
+      currentTime: currentContextTime,
+      performanceNow: performance.now(),
+      outputTimestamp,
+      outputLatency: audioContext.outputLatency,
+      baseLatency: audioContext.baseLatency,
+    });
+  }, [audioContext]);
 
   const getPlaybackTime = useCallback(() => {
     if (!isPlayingRef.current) return state.current.pauseTime;
-    const elapsed = Math.max(0, audioContext.currentTime - playbackRef.current.contextStartTime);
+    const elapsed = Math.max(0, getAudibleContextTime() - playbackRef.current.contextStartTime);
     return Math.min(audioBuffer.duration, playbackRef.current.offset + elapsed);
-  }, [audioBuffer.duration, audioContext]);
+  }, [audioBuffer.duration, getAudibleContextTime]);
+
+  const scheduleVideoPlayback = useCallback((startAt: number, delaySeconds: number) => {
+    clearVideoStartTimer();
+    const video = videoRef.current;
+    if (!video || !videoUrl) return;
+    video.pause();
+    const seekVideo = (time: number) => {
+      try {
+        video.currentTime = time;
+      } catch {
+        // Metadata may still be loading; startVideo will try again.
+      }
+    };
+
+    const startVideo = () => {
+      videoStartTimerRef.current = null;
+      if (!isPlayingRef.current) return;
+      const targetTime = Math.min(getPlaybackTime(), Math.max(0, audioBuffer.duration - 0.001));
+      if (Math.abs(video.currentTime - targetTime) > 0.03) seekVideo(targetTime);
+      void video.play().catch(() => undefined);
+    };
+
+    const delayMs = Math.max(0, delaySeconds * 1000);
+    if (delayMs > 0) {
+      seekVideo(Math.max(0, startAt));
+      videoStartTimerRef.current = window.setTimeout(startVideo, delayMs);
+    } else {
+      startVideo();
+    }
+  }, [audioBuffer.duration, clearVideoStartTimer, getPlaybackTime, videoUrl]);
 
   const disposeSource = useCallback(() => {
+    clearPlaybackEndTimer();
     const source = sourceRef.current;
     sourceRef.current = null;
     if (!source) return;
@@ -140,7 +202,7 @@ export default function Game({ audioBuffer, audioContext, initialBeatmap, energy
       // A source that already ended cannot be stopped again.
     }
     source.disconnect();
-  }, []);
+  }, [clearPlaybackEndTimer]);
 
   const stopAudio = useCallback((rememberPosition = true) => {
     playbackGenerationRef.current += 1;
@@ -148,9 +210,20 @@ export default function Game({ audioBuffer, audioContext, initialBeatmap, energy
       state.current.pauseTime = getPlaybackTime();
       state.current.currentTime = state.current.pauseTime;
     }
+    clearVideoStartTimer();
+    if (videoRef.current) {
+      videoRef.current.pause();
+      if (rememberPosition) {
+        try {
+          videoRef.current.currentTime = state.current.pauseTime;
+        } catch {
+          // Ignore a seek attempted before video metadata is ready.
+        }
+      }
+    }
     disposeSource();
     setPlaybackState(false);
-  }, [disposeSource, getPlaybackTime, setPlaybackState]);
+  }, [clearVideoStartTimer, disposeSource, getPlaybackTime, setPlaybackState]);
 
   const playAudio = useCallback(async (startAt = 0, startEpoch?: number) => {
     const generation = playbackGenerationRef.current + 1;
@@ -179,18 +252,30 @@ export default function Game({ audioBuffer, audioContext, initialBeatmap, energy
         if (sourceRef.current !== source || generation !== playbackGenerationRef.current) return;
         sourceRef.current = null;
         source.disconnect();
-        finishGame(audioBuffer.duration, true);
+        const remainingAudibleSeconds = Math.max(0, audioBuffer.duration - getPlaybackTime());
+        if (remainingAudibleSeconds > 0.005) {
+          playbackEndTimerRef.current = window.setTimeout(() => {
+            playbackEndTimerRef.current = null;
+            if (generation === playbackGenerationRef.current) {
+              finishGame(audioBuffer.duration, true);
+            }
+          }, remainingAudibleSeconds * 1000);
+        } else {
+          finishGame(audioBuffer.duration, true);
+        }
       };
       source.start(contextStartTime, safeOffset);
       setPlaybackError(null);
       setPlaybackState(true);
+      const delayUntilAudibleStart = Math.max(0, contextStartTime - getAudibleContextTime());
+      scheduleVideoPlayback(safeOffset, delayUntilAudibleStart);
     } catch (error) {
       console.error('Audio playback error:', error);
       setPlaybackState(false);
       setCountdown(null);
       setPlaybackError('Audio playback was blocked. Click to start.');
     }
-  }, [audioBuffer, audioContext, disposeSource, finishGame, setPlaybackState]);
+  }, [audioBuffer, audioContext, disposeSource, finishGame, getAudibleContextTime, getPlaybackTime, scheduleVideoPlayback, setPlaybackState]);
 
   // Schedule both the countdown and the audio against the same high-resolution clock.
   useEffect(() => {
@@ -346,6 +431,7 @@ export default function Game({ audioBuffer, audioContext, initialBeatmap, energy
     const ctx = canvas.getContext('2d')!;
 
     let lastUIUpdate = 0;
+    let lastVideoSync = 0;
     let lastTimestamp = performance.now();
 
     const loop = (timestamp: number) => {
@@ -355,6 +441,23 @@ export default function Game({ audioBuffer, audioContext, initialBeatmap, energy
 
       if (isPlaying) {
         s.currentTime = getPlaybackTime();
+
+        const video = videoRef.current;
+        const playbackHasReachedOutput = getAudibleContextTime() >= playbackRef.current.contextStartTime;
+        if (video && videoUrl && playbackHasReachedOutput && timestamp - lastVideoSync > 500) {
+          const drift = video.currentTime - s.currentTime;
+          if (Math.abs(drift) > 0.12) {
+            try {
+              video.currentTime = s.currentTime;
+            } catch {
+              // Ignore a seek attempted before video metadata is ready.
+            }
+          }
+          if (video.paused && s.currentTime < audioBuffer.duration - 0.05) {
+            void video.play().catch(() => undefined);
+          }
+          lastVideoSync = timestamp;
+        }
 
         if (s.currentTime >= audioBuffer.duration) {
           finishGame(audioBuffer.duration, true);
@@ -592,60 +695,47 @@ export default function Game({ audioBuffer, audioContext, initialBeatmap, energy
 
       ctx.restore(); // Restore shake/translate
 
-      if (opponentCanvasRef.current && isMultiplayer) {
-         const octx = opponentCanvasRef.current.getContext('2d')!;
-         const owidth = opponentCanvasRef.current.width;
-         const oheight = opponentCanvasRef.current.height;
-         const olaneWidth = owidth / 4;
-         const scaleY = oheight / height;
-         const oArrowSize = 48; // slightly scaled down but still visible
-         const oReceptorY = RECEPTOR_Y * scaleY;
+      if (isMultiplayer) {
+        const previewCanvases = [videoPreviewCanvasRef.current, mobileVideoPreviewCanvasRef.current]
+          .filter((candidate): candidate is HTMLCanvasElement => candidate !== null);
+        previewCanvases.forEach(previewCanvas => {
+          const previewContext = previewCanvas.getContext('2d')!;
+          const previewWidth = previewCanvas.width;
+          const previewHeight = previewCanvas.height;
+          const video = videoRef.current;
 
-         octx.clearRect(0, 0, owidth, oheight);
-         octx.save();
+          previewContext.clearRect(0, 0, previewWidth, previewHeight);
+          previewContext.fillStyle = '#030712';
+          previewContext.fillRect(0, 0, previewWidth, previewHeight);
 
-         // Receptors
-         for (let i = 0; i < 4; i++) {
-           const x = i * olaneWidth + olaneWidth / 2;
-           if (oppState.current.keyEffects[i] > 0) {
-              oppState.current.keyEffects[i] = Math.max(0, oppState.current.keyEffects[i] - deltaSeconds * 6);
-              octx.globalAlpha = 0.5 + oppState.current.keyEffects[i] * 0.5;
-              drawArrow(octx, x, oReceptorY, oArrowSize * (1 - oppState.current.keyEffects[i] * 0.1), i, COLORS[i], 'pressed');
-              octx.globalAlpha = 1.0;
-           } else {
-              drawArrow(octx, x, oReceptorY, oArrowSize, i, '#4a5568', 'ghost');
-           }
-         }
-
-         // Notes
-         s.beatmap.forEach(note => {
-            const distanceDiff = note.cumulativeDistance! - currentDistance;
-            const y = oReceptorY + distanceDiff * scaleY;
-            const x = note.lane * olaneWidth + olaneWidth / 2;
-            
-            if (note.duration && note.duration > 0 && note.cumulativeDistanceEnd !== undefined) {
-               const endDist = note.cumulativeDistanceEnd;
-               const yEnd = oReceptorY + (endDist - currentDistance) * scaleY;
-               if (yEnd > -50 && y < oheight + 50) {
-                 const drawYStart = (s.currentTime > note.time) ? Math.min(yEnd, oReceptorY) : y;
-                 if (drawYStart < yEnd) {
-                    octx.save();
-                    octx.globalAlpha = 0.6;
-                    octx.fillStyle = COLORS[note.lane];
-                    const tailWidth = 12;
-                    octx.beginPath();
-                    octx.roundRect(x - tailWidth/2, drawYStart, tailWidth, Math.max(1, yEnd - drawYStart), tailWidth/2);
-                    octx.fill();
-                    octx.restore();
-                 }
-               }
-            }
-            
-            if (y > -50 && y < oheight + 50 && s.currentTime < note.time + 0.1) {
-               drawArrow(octx, x, y, oArrowSize, note.lane, COLORS[note.lane], 'normal');
-            }
-         });
-         octx.restore();
+          if (video && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+            && video.videoWidth > 0 && video.videoHeight > 0) {
+            const scale = Math.min(
+              previewWidth / video.videoWidth,
+              previewHeight / video.videoHeight,
+            );
+            const drawWidth = video.videoWidth * scale;
+            const drawHeight = video.videoHeight * scale;
+            previewContext.drawImage(
+              video,
+              (previewWidth - drawWidth) / 2,
+              (previewHeight - drawHeight) / 2,
+              drawWidth,
+              drawHeight,
+            );
+          } else {
+            previewContext.fillStyle = '#67e8f9';
+            previewContext.font = `700 ${Math.max(12, previewWidth / 18)}px sans-serif`;
+            previewContext.textAlign = 'center';
+            previewContext.textBaseline = 'middle';
+            previewContext.fillText(
+              videoUrl ? 'LOADING VIDEO…' : 'AUDIO TRACK — NO VIDEO',
+              previewWidth / 2,
+              previewHeight / 2,
+              previewWidth * 0.9,
+            );
+          }
+        });
       }
 
       // Update DOM UI elements directly for 60fps performance without React overhead
@@ -685,13 +775,13 @@ export default function Game({ audioBuffer, audioContext, initialBeatmap, energy
     animFrameRef.current = requestAnimationFrame(loop);
 
     return () => cancelAnimationFrame(animFrameRef.current);
-  }, [audioBuffer, energyData, finishGame, getPlaybackTime, isEditor, isMultiplayer, isPlaying, settleHoldScore, stopAudio]);
+  }, [audioBuffer, energyData, finishGame, getAudibleContextTime, getPlaybackTime, isEditor, isMultiplayer, isPlaying, settleHoldScore, stopAudio, videoUrl]);
 
   // Input Handling
   useEffect(() => {
     const markDroppedHold = (lane: number, releaseTime: number) => {
       const playbackStarted = isPlayingRef.current
-        && audioContext.currentTime >= playbackRef.current.contextStartTime;
+        && getAudibleContextTime() >= playbackRef.current.contextStartTime;
       if (!playbackStarted) return;
       const droppedNote = state.current.beatmap.find(note =>
         note.lane === lane
@@ -716,12 +806,16 @@ export default function Game({ audioBuffer, audioContext, initialBeatmap, energy
     const handleKeyDown = (e: KeyboardEvent) => {
       const { current: s } = state;
       const playbackStarted = isPlayingRef.current
-        && audioContext.currentTime >= playbackRef.current.contextStartTime;
+        && getAudibleContextTime() >= playbackRef.current.contextStartTime;
       if (!playbackStarted || isEditor || (s.gameState.health <= 0 && !isMultiplayer)) return;
       
       const keyIndex = KEY_CODES.indexOf(e.code);
-      if (keyIndex !== -1 && !s.keys[keyIndex]) {
+      if (keyIndex !== -1) {
         e.preventDefault();
+        if (e.repeat) return;
+
+        // A fresh physical keydown is authoritative even if the browser lost
+        // the previous keyup while focus was moving between elements.
         s.keys[keyIndex] = true;
         s.keyEffects[keyIndex] = 1.0;
 
@@ -767,6 +861,7 @@ export default function Game({ audioBuffer, audioContext, initialBeatmap, energy
     const handleKeyUp = (e: KeyboardEvent) => {
       const keyIndex = KEY_CODES.indexOf(e.code);
       if (keyIndex !== -1) {
+        e.preventDefault();
         const releaseTime = getPlaybackTime();
         markDroppedHold(keyIndex, releaseTime);
         state.current.keys[keyIndex] = false;
@@ -785,14 +880,17 @@ export default function Game({ audioBuffer, audioContext, initialBeatmap, energy
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
     window.addEventListener('blur', releaseAllKeys);
-    document.addEventListener('visibilitychange', releaseAllKeys);
+    const handleVisibilityChange = () => {
+      if (document.hidden) releaseAllKeys();
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('blur', releaseAllKeys);
-      document.removeEventListener('visibilitychange', releaseAllKeys);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [audioContext, getPlaybackTime, isEditor, isMultiplayer, isPlaying, onHit, settleHoldScore, stopAudio]);
+  }, [getAudibleContextTime, getPlaybackTime, isEditor, isMultiplayer, onHit, settleHoldScore, stopAudio]);
 
   // Editor Mouse Handling
   const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -913,6 +1011,17 @@ export default function Game({ audioBuffer, audioContext, initialBeatmap, energy
 
   return (
     <div className="relative w-full min-h-[100dvh] overflow-hidden font-sans text-white select-none" style={{ background: 'radial-gradient(circle at 0% 0%, #2a1b3d 0%, #1a1a2e 50%, #0f3460 100%)' }}>
+      {videoUrl && (
+        <video
+          ref={videoRef}
+          src={videoUrl}
+          muted
+          playsInline
+          preload="auto"
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-0 h-full w-full object-cover opacity-35"
+        />
+      )}
       <div className="absolute top-0 left-0 w-full h-full opacity-30 pointer-events-none" style={{ backgroundImage: 'radial-gradient(#ffffff 1px, transparent 1px)', backgroundSize: '40px 40px' }}></div>
 
       <div className="relative z-10 grid min-h-[100dvh] grid-cols-12 gap-3 p-3 xl:gap-6 xl:p-8">
@@ -1034,6 +1143,15 @@ export default function Game({ audioBuffer, audioContext, initialBeatmap, energy
           <div className="absolute right-2 top-2 z-40 rounded-lg border border-white/15 bg-black/70 px-4 py-2 font-mono text-xl font-black text-purple-200 backdrop-blur xl:hidden">
             <span id="ui-score-mobile">{state.current.gameState.score}</span>
           </div>
+          {isMultiplayer && opponentScore && (
+            <div className="pointer-events-none absolute bottom-4 left-2 z-40 w-[180px] overflow-hidden rounded-xl border border-cyan-400/30 bg-black/75 p-2 shadow-xl backdrop-blur xl:hidden">
+              <div className="mb-1 flex items-center justify-between px-1 text-[8px] font-black uppercase tracking-wider text-cyan-300">
+                <span>Opponent</span>
+                <span className="font-mono text-white">{opponentScore.score}</span>
+              </div>
+              <canvas ref={mobileVideoPreviewCanvasRef} width={328} height={184} className="aspect-video w-full rounded bg-black" />
+            </div>
+          )}
           <div className="aspect-[1/2] w-full max-w-[400px] glass relative overflow-hidden flex items-center justify-center neon-border-purple bg-black/40">
             <canvas 
               ref={canvasRef} 
@@ -1095,9 +1213,9 @@ export default function Game({ audioBuffer, audioContext, initialBeatmap, energy
                 <span className="text-[10px] font-black uppercase tracking-widest text-cyan-400">Opponent</span>
               </div>
               
-              <div className="flex justify-center my-4">
-                <div className="w-[133px] h-[266px] bg-black/60 rounded-lg overflow-hidden border border-cyan-500/20">
-                  <canvas ref={opponentCanvasRef} width={133} height={266} className="w-full h-full opacity-80" />
+              <div className="my-4 flex justify-center">
+                <div className="aspect-video w-full overflow-hidden rounded-lg border border-cyan-500/20 bg-black/60">
+                  <canvas ref={videoPreviewCanvasRef} width={640} height={360} className="h-full w-full" />
                 </div>
               </div>
 

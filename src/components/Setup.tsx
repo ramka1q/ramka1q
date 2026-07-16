@@ -216,11 +216,11 @@ export default function Setup({ onStart, onCreate, onJoin }: SetupProps) {
             disabled={!file}
             className="w-full py-3 glass bg-cyan-600/20 hover:bg-cyan-600/40 text-sm font-black uppercase tracking-widest transition-all neon-border-cyan disabled:opacity-50 disabled:cursor-not-allowed text-white flex items-center justify-center gap-2"
           >
-            <Users className="w-4 h-4" /> Host Multiplayer
+            <Users className="w-4 h-4" /> Create / Host Multiplayer
           </button>
           {file && (
             <p className="text-center text-[10px] font-bold uppercase tracking-wide text-gray-400">
-              Only an optimized audio track is shared—not the video file
+              Videos up to 32 MiB are shared; larger files send optimized audio only
             </p>
           )}
         </div>
@@ -233,7 +233,7 @@ export default function Setup({ onStart, onCreate, onJoin }: SetupProps) {
           </div>
 
           <p className="mb-3 text-center text-[11px] text-gray-400">
-            Guests do not need the audio or video file—the host sends the track automatically.
+            Guests do not need a local file—the host sends the synchronized track automatically.
           </p>
           
           <form
