@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Note, GameState, EnergyData } from '../types';
 import { formatTime } from '../utils/audio';
 import { distanceAtTime, energyAtTime, timeAtDistance } from '../utils/beatmap';
@@ -9,6 +9,14 @@ import {
 } from '../utils/gameplay';
 import type { HitReport } from '../protocol';
 import { Play, Pause, ArrowLeft, Edit3, Save } from 'lucide-react';
+import {
+  activeExperimentalEventAt,
+  detectExperimentalEvents,
+  experimentalLanePosition,
+  experimentalLaneVerticalOffset,
+  experimentalReceptorOpacity,
+  type ExperimentalEventKind,
+} from '../utils/experimental-events';
 
 const KEY_CODES = ['KeyD', 'KeyF', 'KeyJ', 'KeyK'];
 const COLORS = ['#c084fc', '#22d3ee', '#4ade80', '#f87171']; // Purple, Cyan, Green, Red
@@ -19,10 +27,9 @@ const HIT_WINDOWS = { sick: 0.045, good: 0.090, bad: 0.135 };
 interface GameProps {
   audioBuffer: AudioBuffer;
   audioContext: AudioContext;
-  videoUrl?: string | null;
-  audioFromMediaElement?: boolean;
   initialBeatmap: Note[];
   energyData: EnergyData[];
+  experimentalEffects?: boolean;
   onBack: () => void;
   isMultiplayer?: boolean;
   serverStartTime?: number | null;
@@ -31,21 +38,24 @@ interface GameProps {
   onHit?: (report: HitReport) => void;
 }
 
-export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMediaElement = false, initialBeatmap, energyData, onBack, isMultiplayer, serverStartTime, opponentScore, onScoreUpdate, onHit }: GameProps) {
+interface ActiveVisualEffect {
+  id: string;
+  kind: ExperimentalEventKind;
+  origins: readonly { x: number; y: number }[];
+}
+
+export default function Game({ audioBuffer, audioContext, initialBeatmap, energyData, experimentalEffects = true, onBack, isMultiplayer, serverStartTime, opponentScore, onScoreUpdate, onHit }: GameProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const videoPreviewCanvasRef = useRef<HTMLCanvasElement>(null);
-  const mobileVideoPreviewCanvasRef = useRef<HTMLCanvasElement>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
   const pointerLanesRef = useRef(new Map<number, number>());
   
   // A single Web Audio clock drives playback, rendering, and hit judgement.
   const sourceRef = useRef<AudioBufferSourceNode | null>(null);
   const playbackRef = useRef({ contextStartTime: 0, offset: 0 });
   const playbackGenerationRef = useRef(0);
-  const videoStartTimerRef = useRef<number | null>(null);
   const playbackEndTimerRef = useRef<number | null>(null);
   const isPlayingRef = useRef(false);
   const hasFinishedRef = useRef(false);
+  const activeVisualEffectIdRef = useRef<string | null>(null);
   
   // React UI state
   const [isPlaying, setIsPlaying] = useState(false);
@@ -56,6 +66,27 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
   const [countdown, setCountdown] = useState<number | null>(3);
   const [isGameOver, setIsGameOver] = useState(false);
   const [playbackError, setPlaybackError] = useState<string | null>(null);
+  const [activeVisualEffect, setActiveVisualEffect] = useState<ActiveVisualEffect | null>(null);
+
+  const prefersReducedMotion = useMemo(() => (
+    typeof window !== 'undefined'
+      && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
+  ), []);
+  const experimentalEvents = useMemo(() => (
+    experimentalEffects && !prefersReducedMotion
+      ? detectExperimentalEvents(energyData, audioBuffer.duration)
+      : []
+  ), [audioBuffer.duration, energyData, experimentalEffects, prefersReducedMotion]);
+
+  const visualLaneAt = useCallback((lane: number, time: number) => {
+    const event = activeExperimentalEventAt(experimentalEvents, time);
+    return experimentalLanePosition(lane, event, time);
+  }, [experimentalEvents]);
+
+  const visualLaneOffsetYAt = useCallback((lane: number, time: number) => {
+    const event = activeExperimentalEventAt(experimentalEvents, time);
+    return experimentalLaneVerticalOffset(lane, event, time);
+  }, [experimentalEvents]);
   
   // Mutable Game State (avoids React re-renders for 60fps canvas)
   const state = useRef({
@@ -77,13 +108,6 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
   const setPlaybackState = useCallback((playing: boolean) => {
     isPlayingRef.current = playing;
     setIsPlaying(playing);
-  }, []);
-
-  const clearVideoStartTimer = useCallback(() => {
-    if (videoStartTimerRef.current !== null) {
-      window.clearTimeout(videoStartTimerRef.current);
-      videoStartTimerRef.current = null;
-    }
   }, []);
 
   const clearPlaybackEndTimer = useCallback(() => {
@@ -132,11 +156,9 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
     currentState.currentTime = Math.min(audioBuffer.duration, finishTime);
     currentState.pauseTime = currentState.currentTime;
     clearPlaybackEndTimer();
-    clearVideoStartTimer();
-    videoRef.current?.pause();
     setPlaybackState(false);
     setIsGameOver(true);
-  }, [audioBuffer.duration, clearPlaybackEndTimer, clearVideoStartTimer, setPlaybackState, settleHoldScore]);
+  }, [audioBuffer.duration, clearPlaybackEndTimer, setPlaybackState, settleHoldScore]);
 
   const getAudibleContextTime = useCallback(() => {
     const currentContextTime = audioContext.currentTime;
@@ -161,71 +183,6 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
     return Math.min(audioBuffer.duration, playbackRef.current.offset + elapsed);
   }, [audioBuffer.duration, getAudibleContextTime]);
 
-  const handleDirectMediaPlaybackFailure = useCallback((message: string) => {
-    if (!audioFromMediaElement) return;
-    const pauseTime = getPlaybackTime();
-    playbackGenerationRef.current += 1;
-    clearPlaybackEndTimer();
-    clearVideoStartTimer();
-    const source = sourceRef.current;
-    sourceRef.current = null;
-    if (source) {
-      source.onended = null;
-      try {
-        source.stop();
-      } catch {
-        // The silent clock may already have ended.
-      }
-      source.disconnect();
-    }
-    videoRef.current?.pause();
-    state.current.pauseTime = pauseTime;
-    state.current.currentTime = pauseTime;
-    setPlaybackState(false);
-    setCountdown(null);
-    setPlaybackError(message);
-  }, [
-    audioFromMediaElement,
-    clearPlaybackEndTimer,
-    clearVideoStartTimer,
-    getPlaybackTime,
-    setPlaybackState,
-  ]);
-
-  const scheduleVideoPlayback = useCallback((startAt: number, delaySeconds: number) => {
-    clearVideoStartTimer();
-    const video = videoRef.current;
-    if (!video || !videoUrl) return;
-    video.muted = !audioFromMediaElement;
-    video.pause();
-    const seekVideo = (time: number) => {
-      try {
-        video.currentTime = time;
-      } catch {
-        // Metadata may still be loading; startVideo will try again.
-      }
-    };
-
-    const startVideo = () => {
-      videoStartTimerRef.current = null;
-      if (!isPlayingRef.current) return;
-      const targetTime = Math.min(getPlaybackTime(), Math.max(0, audioBuffer.duration - 0.001));
-      if (Math.abs(video.currentTime - targetTime) > 0.03) seekVideo(targetTime);
-      void video.play().catch((error: unknown) => {
-        console.error('Media element playback error:', error);
-        handleDirectMediaPlaybackFailure('Sound playback was blocked. Click to start.');
-      });
-    };
-
-    const delayMs = Math.max(0, delaySeconds * 1000);
-    if (delayMs > 0) {
-      seekVideo(Math.max(0, startAt));
-      videoStartTimerRef.current = window.setTimeout(startVideo, delayMs);
-    } else {
-      startVideo();
-    }
-  }, [audioBuffer.duration, audioFromMediaElement, clearVideoStartTimer, getPlaybackTime, handleDirectMediaPlaybackFailure, videoUrl]);
-
   const disposeSource = useCallback(() => {
     clearPlaybackEndTimer();
     const source = sourceRef.current;
@@ -246,20 +203,9 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
       state.current.pauseTime = getPlaybackTime();
       state.current.currentTime = state.current.pauseTime;
     }
-    clearVideoStartTimer();
-    if (videoRef.current) {
-      videoRef.current.pause();
-      if (rememberPosition) {
-        try {
-          videoRef.current.currentTime = state.current.pauseTime;
-        } catch {
-          // Ignore a seek attempted before video metadata is ready.
-        }
-      }
-    }
     disposeSource();
     setPlaybackState(false);
-  }, [clearVideoStartTimer, disposeSource, getPlaybackTime, setPlaybackState]);
+  }, [disposeSource, getPlaybackTime, setPlaybackState]);
 
   const playAudio = useCallback(async (startAt = 0, startEpoch?: number) => {
     const generation = playbackGenerationRef.current + 1;
@@ -303,15 +249,13 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
       source.start(contextStartTime, safeOffset);
       setPlaybackError(null);
       setPlaybackState(true);
-      const delayUntilAudibleStart = Math.max(0, contextStartTime - getAudibleContextTime());
-      scheduleVideoPlayback(safeOffset, delayUntilAudibleStart);
     } catch (error) {
       console.error('Audio playback error:', error);
       setPlaybackState(false);
       setCountdown(null);
       setPlaybackError('Audio playback was blocked. Click to start.');
     }
-  }, [audioBuffer, audioContext, disposeSource, finishGame, getAudibleContextTime, getPlaybackTime, scheduleVideoPlayback, setPlaybackState]);
+  }, [audioBuffer, audioContext, disposeSource, finishGame, getPlaybackTime, setPlaybackState]);
 
   // Schedule both the countdown and the audio against the same high-resolution clock.
   useEffect(() => {
@@ -467,7 +411,6 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
     const ctx = canvas.getContext('2d')!;
 
     let lastUIUpdate = 0;
-    let lastVideoSync = 0;
     let lastTimestamp = performance.now();
 
     const loop = (timestamp: number) => {
@@ -477,26 +420,6 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
 
       if (isPlaying) {
         s.currentTime = getPlaybackTime();
-
-        const video = videoRef.current;
-        const playbackHasReachedOutput = getAudibleContextTime() >= playbackRef.current.contextStartTime;
-        if (video && videoUrl && playbackHasReachedOutput && timestamp - lastVideoSync > 500) {
-          const drift = video.currentTime - s.currentTime;
-          if (Math.abs(drift) > 0.12) {
-            try {
-              video.currentTime = s.currentTime;
-            } catch {
-              // Ignore a seek attempted before video metadata is ready.
-            }
-          }
-          if (video.paused && s.currentTime < audioBuffer.duration - 0.05) {
-            void video.play().catch((error: unknown) => {
-              console.error('Media element resume error:', error);
-              handleDirectMediaPlaybackFailure('Sound playback was blocked. Click to start.');
-            });
-          }
-          lastVideoSync = timestamp;
-        }
 
         if (s.currentTime >= audioBuffer.duration) {
           finishGame(audioBuffer.duration, true);
@@ -526,6 +449,36 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
       const height = canvas.height;
       const laneWidth = width / 4;
       const arrowSize = 64;
+      const activeEvent = isPlaying
+        ? activeExperimentalEventAt(experimentalEvents, s.currentTime)
+        : null;
+      const receptorOpacity = experimentalReceptorOpacity(activeEvent, s.currentTime);
+      const visualLane = (lane: number) => experimentalLanePosition(lane, activeEvent, s.currentTime);
+      const visualLaneOffsetY = (lane: number) => experimentalLaneVerticalOffset(
+        lane,
+        activeEvent,
+        s.currentTime,
+      );
+
+      if (activeVisualEffectIdRef.current !== (activeEvent?.id ?? null)) {
+        activeVisualEffectIdRef.current = activeEvent?.id ?? null;
+        if (!activeEvent) {
+          setActiveVisualEffect(null);
+        } else {
+          const rect = canvas.getBoundingClientRect();
+          const origins = activeEvent.kind === 'arrow-flight'
+            ? [0, 1, 2, 3].map(lane => ({
+                x: rect.left + ((lane + 0.5) / 4) * rect.width,
+                y: rect.top + (RECEPTOR_Y / height) * rect.height,
+              }))
+            : [];
+          setActiveVisualEffect({
+            id: activeEvent.id,
+            kind: activeEvent.kind,
+            origins,
+          });
+        }
+      }
 
       // Clear Canvas
       ctx.clearRect(0, 0, width, height);
@@ -592,22 +545,26 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
 
       // Receptors
       for (let i = 0; i < 4; i++) {
-        const x = i * laneWidth + laneWidth / 2;
+        const x = visualLane(i) * laneWidth + laneWidth / 2;
+        const receptorY = RECEPTOR_Y + visualLaneOffsetY(i);
         const laneColor = isPlaying ? getLaneColor(i) : COLORS[i];
         if (s.keyEffects[i] > 0) {
           s.keyEffects[i] = Math.max(0, s.keyEffects[i] - deltaSeconds * 3);
           const glow = s.keyEffects[i];
-          
-          ctx.globalAlpha = 0.1;
-          ctx.fillStyle = laneColor; 
-          ctx.fillRect(i * laneWidth, -20, laneWidth, height + 40); // Lane highlight
-          ctx.globalAlpha = 1.0;
 
-          ctx.globalAlpha = 0.5 + glow * 0.5;
-          drawArrow(ctx, x, RECEPTOR_Y, arrowSize * (1 - glow * 0.1), i, laneColor, 'pressed');
-          ctx.globalAlpha = 1.0;
+          ctx.save();
+          ctx.globalAlpha = 0.1 * receptorOpacity;
+          ctx.fillStyle = laneColor; 
+          ctx.fillRect(x - laneWidth / 2, -20, laneWidth, height + 40); // Lane highlight
+
+          ctx.globalAlpha = (0.5 + glow * 0.5) * receptorOpacity;
+          drawArrow(ctx, x, receptorY, arrowSize * (1 - glow * 0.1), i, laneColor, 'pressed');
+          ctx.restore();
         } else {
-          drawArrow(ctx, x, RECEPTOR_Y, arrowSize, i, tier === 0 && isPlaying ? '#374151' : '#4a5568', 'ghost');
+          ctx.save();
+          ctx.globalAlpha = receptorOpacity;
+          drawArrow(ctx, x, receptorY, arrowSize, i, tier === 0 && isPlaying ? '#374151' : '#4a5568', 'ghost');
+          ctx.restore();
         }
       }
 
@@ -623,14 +580,15 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
 
         const distanceDiff = noteDist - currentDistance;
         const timeDiff = note.time - s.currentTime;
-        const y = RECEPTOR_Y + distanceDiff;
+        const laneOffsetY = visualLaneOffsetY(note.lane);
+        const y = RECEPTOR_Y + distanceDiff + laneOffsetY;
 
-        const x = note.lane * laneWidth + laneWidth / 2;
+        const x = visualLane(note.lane) * laneWidth + laneWidth / 2;
 
         // Draw Tail for long notes
         if (note.duration && note.duration > 0 && note.cumulativeDistanceEnd !== undefined) {
            const endDist = note.cumulativeDistanceEnd;
-           const yEnd = RECEPTOR_Y + (endDist - currentDistance);
+           const yEnd = RECEPTOR_Y + (endDist - currentDistance) + laneOffsetY;
            
            if (yEnd > -100 && y < height + 100) {
              const drawYStart = (note.hit && !note.missed && s.currentTime > note.time) ? Math.min(yEnd, RECEPTOR_Y) : y;
@@ -668,7 +626,7 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
           s.gameState.combo = 0;
           s.gameState.health = Math.max(0, s.gameState.health - 2.5);
           s.gameState.misses++;
-          addPopup('MISS', '#ef4444', x, RECEPTOR_Y);
+          addPopup('MISS', '#ef4444', x, RECEPTOR_Y + laneOffsetY);
         }
 
         // Hold logic
@@ -678,10 +636,10 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
             if (s.keys[note.lane] || s.currentTime >= endTime) {
                settleHoldScore(note, Math.min(s.currentTime, endTime));
                s.keyEffects[note.lane] = 1.0;
-               if (Math.random() < 1 - Math.exp(-deltaSeconds * 9)) spawnParticles(x, RECEPTOR_Y, getLaneColor(note.lane));
+               if (Math.random() < 1 - Math.exp(-deltaSeconds * 9)) spawnParticles(x, RECEPTOR_Y + laneOffsetY, getLaneColor(note.lane));
             } else if (s.currentTime < endTime - 0.15) {
                note.missed = true;
-               addPopup('DROP', '#ef4444', x, RECEPTOR_Y);
+               addPopup('DROP', '#ef4444', x, RECEPTOR_Y + laneOffsetY);
                s.gameState.combo = 0;
                s.gameState.misses++;
                s.gameState.health = Math.max(0, s.gameState.health - 2);
@@ -734,49 +692,6 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
 
       ctx.restore(); // Restore shake/translate
 
-      if (isMultiplayer && !audioFromMediaElement) {
-        const previewCanvases = [videoPreviewCanvasRef.current, mobileVideoPreviewCanvasRef.current]
-          .filter((candidate): candidate is HTMLCanvasElement => candidate !== null);
-        previewCanvases.forEach(previewCanvas => {
-          const previewContext = previewCanvas.getContext('2d')!;
-          const previewWidth = previewCanvas.width;
-          const previewHeight = previewCanvas.height;
-          const video = videoRef.current;
-
-          previewContext.clearRect(0, 0, previewWidth, previewHeight);
-          previewContext.fillStyle = '#030712';
-          previewContext.fillRect(0, 0, previewWidth, previewHeight);
-
-          if (video && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
-            && video.videoWidth > 0 && video.videoHeight > 0) {
-            const scale = Math.min(
-              previewWidth / video.videoWidth,
-              previewHeight / video.videoHeight,
-            );
-            const drawWidth = video.videoWidth * scale;
-            const drawHeight = video.videoHeight * scale;
-            previewContext.drawImage(
-              video,
-              (previewWidth - drawWidth) / 2,
-              (previewHeight - drawHeight) / 2,
-              drawWidth,
-              drawHeight,
-            );
-          } else {
-            previewContext.fillStyle = '#67e8f9';
-            previewContext.font = `700 ${Math.max(12, previewWidth / 18)}px sans-serif`;
-            previewContext.textAlign = 'center';
-            previewContext.textBaseline = 'middle';
-            previewContext.fillText(
-              videoUrl ? 'LOADING VIDEO…' : 'AUDIO TRACK — NO VIDEO',
-              previewWidth / 2,
-              previewHeight / 2,
-              previewWidth * 0.9,
-            );
-          }
-        });
-      }
-
       // Update DOM UI elements directly for 60fps performance without React overhead
       const scoreEl = document.getElementById('ui-score');
       if (scoreEl) scoreEl.innerText = s.gameState.score.toString();
@@ -814,7 +729,7 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
     animFrameRef.current = requestAnimationFrame(loop);
 
     return () => cancelAnimationFrame(animFrameRef.current);
-  }, [audioBuffer, audioFromMediaElement, energyData, finishGame, getAudibleContextTime, getPlaybackTime, handleDirectMediaPlaybackFailure, isEditor, isMultiplayer, isPlaying, settleHoldScore, stopAudio, videoUrl]);
+  }, [audioBuffer, energyData, experimentalEvents, finishGame, getPlaybackTime, isEditor, isMultiplayer, isPlaying, settleHoldScore, stopAudio]);
 
   // Input Handling
   useEffect(() => {
@@ -838,8 +753,13 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
       state.current.gameState.misses++;
       state.current.gameState.health = Math.max(0, state.current.gameState.health - 2);
       const canvasWidth = canvasRef.current?.width ?? 400;
-      const x = droppedNote.lane * (canvasWidth / 4) + (canvasWidth / 8);
-      addPopup('DROP', '#ef4444', x, RECEPTOR_Y);
+      const x = visualLaneAt(droppedNote.lane, releaseTime) * (canvasWidth / 4) + (canvasWidth / 8);
+      addPopup(
+        'DROP',
+        '#ef4444',
+        x,
+        RECEPTOR_Y + visualLaneOffsetYAt(droppedNote.lane, releaseTime),
+      );
     };
 
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -887,9 +807,10 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
           onHit?.({ noteId: closestNote.id, hitTime: judgementTime });
 
           const canvasWidth = canvasRef.current?.width ?? 400;
-          const x = closestNote.lane * (canvasWidth / 4) + (canvasWidth / 8);
-          addPopup(rating, color, x, RECEPTOR_Y - 40);
-          spawnParticles(x, RECEPTOR_Y, COLORS[closestNote.lane]);
+          const x = visualLaneAt(closestNote.lane, judgementTime) * (canvasWidth / 4) + (canvasWidth / 8);
+          const receptorY = RECEPTOR_Y + visualLaneOffsetYAt(closestNote.lane, judgementTime);
+          addPopup(rating, color, x, receptorY - 40);
+          spawnParticles(x, receptorY, COLORS[closestNote.lane]);
         } else {
           s.gameState.health = Math.max(0, s.gameState.health - 1);
           s.gameState.combo = 0;
@@ -929,7 +850,7 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
       window.removeEventListener('blur', releaseAllKeys);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [getAudibleContextTime, getPlaybackTime, isEditor, isMultiplayer, onHit, settleHoldScore, stopAudio]);
+  }, [getAudibleContextTime, getPlaybackTime, isEditor, isMultiplayer, onHit, settleHoldScore, stopAudio, visualLaneAt, visualLaneOffsetYAt]);
 
   // Editor Mouse Handling
   const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -994,7 +915,14 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
     if (isEditor) return;
     event.preventDefault();
     const rect = event.currentTarget.getBoundingClientRect();
-    const lane = Math.min(3, Math.max(0, Math.floor(((event.clientX - rect.left) / rect.width) * 4)));
+    const pointerLanePosition = (((event.clientX - rect.left) / rect.width) * 4) - 0.5;
+    const eventTime = getPlaybackTime();
+    const lane = [0, 1, 2, 3].reduce((closest, candidate) => (
+      Math.abs(visualLaneAt(candidate, eventTime) - pointerLanePosition)
+        < Math.abs(visualLaneAt(closest, eventTime) - pointerLanePosition)
+        ? candidate
+        : closest
+    ), 0);
     pointerLanesRef.current.set(event.pointerId, lane);
     event.currentTarget.setPointerCapture(event.pointerId);
     window.dispatchEvent(new KeyboardEvent('keydown', { code: KEY_CODES[lane] }));
@@ -1050,19 +978,40 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
 
   return (
     <div className="relative w-full min-h-[100dvh] overflow-hidden font-sans text-white select-none" style={{ background: 'radial-gradient(circle at 0% 0%, #2a1b3d 0%, #1a1a2e 50%, #0f3460 100%)' }}>
-      {videoUrl && (
-        <video
-          ref={videoRef}
-          src={videoUrl}
-          muted={!audioFromMediaElement}
-          playsInline
-          preload="auto"
+      {activeVisualEffect && (
+        <div
+          key={activeVisualEffect.id}
+          className="pointer-events-none fixed inset-0 z-[80] overflow-hidden"
           aria-hidden="true"
-          onError={() => handleDirectMediaPlaybackFailure('This browser cannot play the video sound. Try converting it to MP4 with AAC audio or WebM with Opus audio.')}
-          className={audioFromMediaElement
-            ? 'pointer-events-none fixed left-0 top-0 h-px w-px opacity-0'
-            : 'pointer-events-none absolute inset-0 h-full w-full object-cover opacity-35'}
-        />
+        >
+          <div className="experimental-event-label">
+            {activeVisualEffect.kind === 'lane-swap' ? 'LANE SHIFT' : 'ARROW RUSH'}
+          </div>
+          {activeVisualEffect.kind === 'arrow-flight' && activeVisualEffect.origins.map((origin, lane) => {
+            const customProperties = {
+              '--experimental-x': `${origin.x}px`,
+              '--experimental-y': `${origin.y}px`,
+              '--experimental-delay': `${lane * 65}ms`,
+              '--experimental-color': COLORS[lane],
+            } as React.CSSProperties;
+            return (
+              <React.Fragment key={`${activeVisualEffect.id}-${lane}`}>
+                <span
+                  className="experimental-flight-arrow experimental-flight-arrow-lead"
+                  style={customProperties}
+                >
+                  {['←', '↓', '↑', '→'][lane]}
+                </span>
+                <span
+                  className="experimental-flight-arrow experimental-flight-arrow-chase"
+                  style={customProperties}
+                >
+                  {['←', '↓', '↑', '→'][lane]}
+                </span>
+              </React.Fragment>
+            );
+          })}
+        </div>
       )}
       <div className="absolute top-0 left-0 w-full h-full opacity-30 pointer-events-none" style={{ backgroundImage: 'radial-gradient(#ffffff 1px, transparent 1px)', backgroundSize: '40px 40px' }}></div>
 
@@ -1186,14 +1135,15 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
             <span id="ui-score-mobile">{state.current.gameState.score}</span>
           </div>
           {isMultiplayer && opponentScore && (
-            <div className="pointer-events-none absolute bottom-4 left-2 z-40 w-[180px] overflow-hidden rounded-xl border border-cyan-400/30 bg-black/75 p-2 shadow-xl backdrop-blur xl:hidden">
+            <div className="pointer-events-none absolute bottom-4 left-2 z-40 w-[180px] overflow-hidden rounded-xl border border-cyan-400/30 bg-black/75 p-3 shadow-xl backdrop-blur xl:hidden">
               <div className="mb-1 flex items-center justify-between px-1 text-[8px] font-black uppercase tracking-wider text-cyan-300">
                 <span>Opponent</span>
                 <span className="font-mono text-white">{opponentScore.score}</span>
               </div>
-              {!audioFromMediaElement && (
-                <canvas ref={mobileVideoPreviewCanvasRef} width={328} height={184} className="aspect-video w-full rounded bg-black" />
-              )}
+              <div className="flex items-center justify-between px-1 font-mono text-xs text-white/80">
+                <span>Combo</span>
+                <span>{opponentScore.combo}</span>
+              </div>
             </div>
           )}
           <div className="aspect-[1/2] w-full max-w-[400px] glass relative overflow-hidden flex items-center justify-center neon-border-purple bg-black/40">
@@ -1223,7 +1173,7 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
               >
                 <span className="text-xl font-black uppercase tracking-widest text-red-300">{playbackError}</span>
                 <span className="rounded-xl bg-purple-600 px-6 py-3 text-sm font-black uppercase tracking-widest text-white">
-                  {audioFromMediaElement ? 'Start without video' : 'Start audio'}
+                  Start audio
                 </span>
               </button>
             )}
@@ -1259,14 +1209,6 @@ export default function Game({ audioBuffer, audioContext, videoUrl, audioFromMed
                 <span className="text-[10px] font-black uppercase tracking-widest text-cyan-400">Opponent</span>
               </div>
               
-              {!audioFromMediaElement && (
-                <div className="my-4 flex justify-center">
-                  <div className="aspect-video w-full overflow-hidden rounded-lg border border-cyan-500/20 bg-black/60">
-                    <canvas ref={videoPreviewCanvasRef} width={640} height={360} className="h-full w-full" />
-                  </div>
-                </div>
-              )}
-
               <div className="flex items-baseline justify-between relative z-10">
                 <span className="text-4xl font-black italic font-mono tracking-tighter text-cyan-300 drop-shadow-[0_0_10px_#22d3ee]">{opponentScore.score}</span>
               </div>

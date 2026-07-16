@@ -1,8 +1,10 @@
 # FNF X-Creator
 
-FNF X-Creator is a browser rhythm game that builds an adaptive beatmap from an audio or video file. Audio analysis runs locally in the browser using Web Audio energy and peak detection; it does not use an AI service or require an API key.
+FNF X-Creator is a browser rhythm game that builds an adaptive beatmap from an audio or video file. Video files are used solely as audio sources and are never displayed. Audio analysis runs locally in the browser using Web Audio energy and peak detection; it does not use an AI service or require an API key.
 
-You can play a generated or imported JSON beatmap in single-player mode, or create a two-player room backed by Socket.IO. Any player can create and host a room. The host chooses the audio or video, and the server relays the prepared track and beatmap to the friend automatically.
+You can play a generated or imported JSON beatmap in single-player mode, or create a two-player room backed by Socket.IO. Any player can create and host a room. The host chooses the audio or video, and the server relays the synchronized audio source and beatmap to the friend automatically.
+
+Optional **Experimental events** add animated lane swaps and screen-wide arrow flights when a quiet break follows a louder section. They are visual only, do not change note timing or judgement, and can be disabled before starting or joining a game.
 
 ## Requirements
 
@@ -25,7 +27,7 @@ Both players use the same public Node/Socket.IO app URL; a `localhost` link cann
 1. The host opens the public app, chooses an audio or video file, and creates a multiplayer room.
 2. The host copies and sends the generated invite link.
 3. The friend opens the link and clicks **Join & enable sound**. No audio or video file is needed on the friend's device.
-4. The shared track downloads from the room server, then the game starts for both players in sync. Video files up to 32 MiB are shown to both players as a synchronized background.
+4. The shared audio source downloads from the room server, then the game starts for both players in sync. When the host selects a video, both players hear its extracted audio; the video is never displayed.
 
 ## Deploy free on Render
 
@@ -48,7 +50,7 @@ npm start
 
 ## Multiplayer limits
 
-Local audio and video files are limited to 100 MiB and 25 minutes. Audio files are optimized before multiplayer upload to mono 32 kHz PCM WAV. Video files up to 32 MiB are relayed in their original format so both players can see them; larger videos fall back to synchronized optimized audio for the guest. A relayed track is limited to 32 MiB per room, which is approximately 8 minutes 44 seconds for optimized audio. The server reserves at most 256 MiB for active room media, beatmaps, indexes, and energy data. Rooms expire after 30 minutes of inactivity (or shortly after a game ends) and are lost when the server restarts.
+Local audio and video files are limited to 100 MiB and 25 minutes. Audio files are optimized before multiplayer upload to mono 32 kHz PCM WAV. Video files up to 32 MiB can be relayed in their original container solely so the guest can extract the same audio; larger videos send synchronized optimized audio instead. If a video's audio track cannot be decoded or extracted, the app reports an error instead of starting silent gameplay. A relayed track is limited to 32 MiB per room, which is approximately 8 minutes 44 seconds for optimized audio. The server reserves at most 256 MiB for active room media, beatmaps, indexes, and energy data. Rooms expire after 30 minutes of inactivity (or shortly after a game ends) and are lost when the server restarts.
 
 A room works only on the server instance that created it. Production horizontal scaling therefore requires shared room storage and a Socket.IO adapter. Set `APP_ORIGIN` to the exact public browser origin when the Socket.IO endpoint is exposed through a proxy or custom domain. Admission limits use the direct socket address by default. Set `TRUST_PROXY=true` only when a trusted reverse proxy overwrites `X-Forwarded-For` and direct access to Node is blocked; otherwise forwarded addresses can be spoofed. Without that opt-in, proxied users share one server-side address bucket.
 
