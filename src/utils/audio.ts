@@ -11,16 +11,19 @@ const SUSTAIN_BODY_FLOOR_RATIO = 0.75;
 const SUSTAIN_MIN_ATTACK_RATIO = 0.08;
 const SUSTAIN_GAP_TOLERANCE_SECONDS = 0.06;
 const SUSTAIN_REARTICULATION_GAP_SECONDS = 0.02;
-const SUSTAIN_LATE_BODY_START_SECONDS = 0.32;
 const SUSTAIN_LATE_BODY_WINDOW_SECONDS = 0.2;
-const SUSTAIN_BASELINE_RISE_RATIO = 1.18;
-const SUSTAIN_LATE_BODY_RATIO = 0.62;
-const SUSTAIN_SPECTRAL_FACTOR_LIMIT = 1.75;
+const SUSTAIN_MIN_EXCESS_POWER_RATIO = 0.04;
+const SUSTAIN_LATE_EXCESS_POWER_RATIO = 0.3;
+const SUSTAIN_FLOOR_EXCESS_POWER_RATIO = 0.5;
+const SUSTAIN_ATTACK_SPECTRAL_FACTOR_LIMIT = 2.4;
+const SUSTAIN_BASELINE_SPECTRAL_FACTOR_LIMIT = 1.2;
+const SUSTAIN_REARTICULATION_SPECTRAL_FACTOR_LIMIT = 1.75;
 const SUSTAIN_MIN_SPECTRAL_RATIO = 0.015;
-const SUSTAIN_SPECTRAL_MAD_LIMIT = 0.2;
+const SUSTAIN_SPECTRAL_MAD_LIMIT = 0.32;
 const SUSTAIN_SPECTRAL_BLOCK_SECONDS = 0.1;
-const SUSTAIN_SPECTRAL_BLOCK_DEVIATION_LIMIT = 0.22;
-const MIN_HOLD_SECONDS = 0.5;
+const SUSTAIN_SPECTRAL_BLOCK_DEVIATION_LIMIT = 0.3;
+const SUSTAIN_UNSTABLE_BLOCK_LIMIT = 3;
+const MIN_HOLD_SECONDS = 0.4;
 const MAX_HOLD_SECONDS = 3;
 const MAX_AUDIO_FILE_BYTES = 100 * 1024 * 1024;
 const MAX_ANALYSIS_SECONDS = 25 * 60;
@@ -349,7 +352,6 @@ export const analyzeSamples = (
     return strength > previous && strength >= next;
   });
 
-  const rmsPrefix = prefixSums(features.rms).sums;
   const sustainLookbackFrames = Math.max(
     1,
     Math.round(SUSTAIN_LOOKBACK_SECONDS / features.frameDuration),
@@ -369,10 +371,6 @@ export const analyzeSamples = (
   const minimumRearticulationGapFrames = Math.max(
     1,
     Math.round(SUSTAIN_REARTICULATION_GAP_SECONDS / features.frameDuration),
-  );
-  const sustainLateBodyStartFrames = Math.max(
-    1,
-    Math.round(SUSTAIN_LATE_BODY_START_SECONDS / features.frameDuration),
   );
   const sustainLateBodyWindowFrames = Math.max(
     1,
@@ -406,12 +404,15 @@ export const analyzeSamples = (
     const overlapsActiveHold = activeLongNotesEndTime.some(
       endTime => noteTime + EPSILON < endTime,
     );
-
     const lookbackStart = Math.max(0, frameIndex - sustainLookbackFrames);
-    const lookbackCount = frameIndex - lookbackStart;
-    const precedingRms = lookbackCount > 0
-      ? (rmsPrefix[frameIndex] - rmsPrefix[lookbackStart]) / lookbackCount
-      : 0;
+    const precedingRms = percentile(
+      features.rms.slice(lookbackStart, frameIndex),
+      0.5,
+    );
+    const precedingSpectralRatio = percentile(
+      features.spectralRatio.slice(lookbackStart, frameIndex),
+      0.5,
+    );
     const bodyWindowStart = Math.min(
       features.rms.length,
       frameIndex + sustainBodyDelayFrames,
@@ -428,30 +429,31 @@ export const analyzeSamples = (
       features.spectralRatio.slice(bodyWindowStart, bodyWindowEnd),
       0.5,
     );
-    const lateBodyWindowStart = Math.min(
-      features.rms.length,
-      frameIndex + sustainLateBodyStartFrames,
-    );
-    const lateBodyWindowEnd = Math.min(
-      features.rms.length,
-      lateBodyWindowStart + sustainLateBodyWindowFrames,
-    );
-    const lateBodyRms = percentile(
-      features.rms.slice(lateBodyWindowStart, lateBodyWindowEnd),
-      0.25,
-    );
     const attackSpectralRatio = features.spectralRatio[frameIndex];
     const lowerSpectralRatio = Math.min(attackSpectralRatio, bodySpectralRatio);
     const upperSpectralRatio = Math.max(attackSpectralRatio, bodySpectralRatio);
     const spectralFactor = upperSpectralRatio / Math.max(lowerSpectralRatio, EPSILON);
-    const hasSpectralContinuity = lowerSpectralRatio < SUSTAIN_MIN_SPECTRAL_RATIO
-      || spectralFactor <= SUSTAIN_SPECTRAL_FACTOR_LIMIT;
-    const risesAboveBaseline = precedingRms <= EPSILON
-      || bodyRms >= precedingRms * SUSTAIN_BASELINE_RISE_RATIO;
-    const hasStableLateBody = lateBodyRms >= Math.max(
-      bodyRms * SUSTAIN_LATE_BODY_RATIO,
-      precedingRms * SUSTAIN_BASELINE_RISE_RATIO,
+    const lowerBaselineBodyRatio = Math.min(
+      precedingSpectralRatio,
+      bodySpectralRatio,
     );
+    const upperBaselineBodyRatio = Math.max(
+      precedingSpectralRatio,
+      bodySpectralRatio,
+    );
+    const baselineBodySpectralFactor = upperBaselineBodyRatio
+      / Math.max(lowerBaselineBodyRatio, EPSILON);
+    const bodyDiffersFromBaseline = lowerBaselineBodyRatio < SUSTAIN_MIN_SPECTRAL_RATIO
+      || baselineBodySpectralFactor > SUSTAIN_BASELINE_SPECTRAL_FACTOR_LIMIT;
+    const hasSpectralContinuity = lowerSpectralRatio < SUSTAIN_MIN_SPECTRAL_RATIO
+      || spectralFactor <= SUSTAIN_ATTACK_SPECTRAL_FACTOR_LIMIT
+      || bodyDiffersFromBaseline;
+    const baselinePower = precedingRms * precedingRms;
+    const bodyPower = bodyRms * bodyRms;
+    const bodyExcessPower = Math.max(0, bodyPower - baselinePower);
+    const hasBodyExcess = precedingRms <= EPSILON
+      ? bodyRms > EPSILON
+      : bodyExcessPower >= baselinePower * SUSTAIN_MIN_EXCESS_POWER_RATIO;
     const sustainFloor = Math.max(
       Math.max(
         features.rms[frameIndex] * SUSTAIN_MIN_ATTACK_RATIO,
@@ -460,7 +462,9 @@ export const analyzeSamples = (
           bodyRms * SUSTAIN_BODY_FLOOR_RATIO,
         ),
       ),
-      precedingRms * 1.1,
+      Math.sqrt(
+        baselinePower + bodyExcessPower * SUSTAIN_FLOOR_EXCESS_POWER_RATIO,
+      ),
       robustRms * 0.04,
     );
     let lastSustainFrame = frameIndex;
@@ -478,7 +482,18 @@ export const analyzeSamples = (
           break;
         }
         if (onsetCandidates[forwardIndex] && forwardIndex >= bodyWindowEnd) {
-          const rearticulationSpectralRatio = features.spectralRatio[forwardIndex];
+          const rearticulationBodyStart = Math.min(
+            features.spectralRatio.length,
+            forwardIndex + sustainBodyDelayFrames,
+          );
+          const rearticulationBodyEnd = Math.min(
+            features.spectralRatio.length,
+            rearticulationBodyStart + sustainBodyWindowFrames,
+          );
+          const rearticulationSpectralRatio = percentile(
+            features.spectralRatio.slice(rearticulationBodyStart, rearticulationBodyEnd),
+            0.5,
+          );
           const lowerRearticulationRatio = Math.min(
             bodySpectralRatio,
             rearticulationSpectralRatio,
@@ -491,7 +506,7 @@ export const analyzeSamples = (
             / Math.max(lowerRearticulationRatio, EPSILON);
           if (
             lowerRearticulationRatio >= SUSTAIN_MIN_SPECTRAL_RATIO
-            && rearticulationFactor > SUSTAIN_SPECTRAL_FACTOR_LIMIT
+            && rearticulationFactor > SUSTAIN_REARTICULATION_SPECTRAL_FACTOR_LIMIT
           ) {
             break;
           }
@@ -527,7 +542,7 @@ export const analyzeSamples = (
         unstableSpectralBlocks = relativeDeviation > SUSTAIN_SPECTRAL_BLOCK_DEVIATION_LIMIT
           ? unstableSpectralBlocks + 1
           : 0;
-        if (unstableSpectralBlocks >= 2) {
+        if (unstableSpectralBlocks >= SUSTAIN_UNSTABLE_BLOCK_LIMIT) {
           lastSustainFrame = Math.max(
             frameIndex,
             blockStart - sustainSpectralBlockFrames - 1,
@@ -542,6 +557,19 @@ export const analyzeSamples = (
       (lastSustainFrame + 1) * features.frameDuration,
     );
     const possibleDuration = Math.max(0, sustainEnd - noteTime);
+    const lateBodyWindowEnd = lastSustainFrame + 1;
+    const lateBodyWindowStart = Math.max(
+      bodyWindowEnd,
+      lateBodyWindowEnd - sustainLateBodyWindowFrames,
+    );
+    const lateBodyRms = percentile(
+      features.rms.slice(lateBodyWindowStart, lateBodyWindowEnd),
+      0.25,
+    );
+    const lateBodyPower = lateBodyRms * lateBodyRms;
+    const lateBodyExcessPower = Math.max(0, lateBodyPower - baselinePower);
+    const hasStableLateBody = lateBodyExcessPower
+      >= bodyExcessPower * SUSTAIN_LATE_EXCESS_POWER_RATIO;
     const sustainedSpectralRatios = features.spectralRatio
       .slice(bodyWindowStart, lastSustainFrame + 1)
       .filter(value => value >= SUSTAIN_MIN_SPECTRAL_RATIO);
@@ -557,8 +585,8 @@ export const analyzeSamples = (
     const hasStableSpectralBody = sustainedSpectralRatios.length === 0
       || sustainedSpectralMad <= SUSTAIN_SPECTRAL_MAD_LIMIT;
     const duration = possibleDuration >= MIN_HOLD_SECONDS
-      && !overlapsActiveHold
-      && risesAboveBaseline
+      && (!overlapsActiveHold || bodyDiffersFromBaseline)
+      && hasBodyExcess
       && hasStableLateBody
       && hasSpectralContinuity
       && hasStableSpectralBody
