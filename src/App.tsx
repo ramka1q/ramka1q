@@ -293,7 +293,9 @@ export default function App() {
                 ? new Blob([sharedMedia.slice(0)], { type: sharedMimeType })
                 : null;
               const decodedBuffer = sharedVideo
-                ? await decodeMediaAudio(sharedVideo, context, true)
+                ? await decodeMediaAudio(sharedVideo, context, true, message => {
+                    if (isCurrentRequest()) setLoadingText(message);
+                  })
                 : await context.decodeAudioData(sharedMedia);
               if (!isCurrentRequest()) {
                 socket.emit('leaveRoom', payload.roomId);
@@ -464,7 +466,9 @@ export default function App() {
       const contextPromise = ensurePlaybackContext();
       const socketPromise = mode === 'create' ? connectSocket() : Promise.resolve(null);
       const [{ buffer, beatmap: generatedBeatmap, energyData: generatedEnergyData }, context, socket] = await Promise.all([
-        analyzeAudio(file, sensitivity),
+        analyzeAudio(file, sensitivity, message => {
+          if (generation === sessionGenerationRef.current) setLoadingText(message);
+        }),
         contextPromise,
         socketPromise,
       ]);
